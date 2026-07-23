@@ -6,7 +6,7 @@ is the GUI counterpart to the terminal-based [`mb-powermon`](../mb-powermon)
 Python tool — same telemetry, rendered as scrolling time-series graphs in a
 native desktop window.
 
-![Power Monitor GUI](assets/screenshot.png)
+![NPU Power and Temperature Monitoring GUI](assets/screenshot.png)
 
 ## What it shows
 
@@ -19,6 +19,13 @@ values:
 Every metric from a given card shares that card's color, kept consistent across
 both graphs, and the legend groups metrics **one device per row** (prefixed with
 the PCIe BDF), e.g. `0000:c2:00.0 Axelera  SYS · AI0 · AI1 · AI2 · AI3`.
+
+Each device row also carries a **per-device summary** between the name and the
+individual readings: temperature shows the device's **average** across its
+sensors (`avg 60°C`), power shows the **max** across its readings (`max 0.93 W`).
+With one power source per card today the max equals that lone reading, but it's
+computed over all of a device's power metrics — so when an external INA228 meter
+is added alongside the on-card source, the label reports the highest of them.
 
 ## Supported devices & how telemetry is read
 
@@ -74,7 +81,8 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
 ## Design
 
 - **Sampling** runs once per second; each graph keeps a 60-second (61-point)
-  history and draws newest-on-the-right.
+  history and draws newest-on-the-right. The per-device summary (avg temp / max
+  power) is recomputed each tick, skipping any `NaN` readings.
 - **Colors** come only from the project brand palette: device series use the
   **accent** colors (Amber → Hailo, Slate Blue → DeepX, Sage → MemryX, Plum →
   Axelera; Coral reserved for alerts, Sand for fills), graph chrome uses the

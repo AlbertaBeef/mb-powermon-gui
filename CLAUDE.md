@@ -11,10 +11,15 @@ Monitor** (Resources tab). It is the GUI counterpart to the sibling Python TUI i
 but **no code**.
 
 The UI is deliberately simple: **two sections, Power and Temperature**, each a
-scrolling 60 s time-series graph with a per-device legend of live values. It does
-**not** show CPU/Memory/Network/Disk — an earlier iteration did (styled exactly
-like System Monitor's resource graphs) but that was scrapped; if you find any
-reference to `Sampler`, `Gauge`, or CPU/Mem panels, it's stale.
+scrolling 60 s time-series graph with a per-device legend of live values. Each
+legend row also shows a **per-device summary** between the device name and its
+individual entries: temperature averages its sensors (`avg 60°C`), power takes
+the max of its readings (`max 0.93 W`). It does **not** show
+CPU/Memory/Network/Disk — an earlier iteration did (styled exactly like System
+Monitor's resource graphs) but that was scrapped; if you find any reference to
+`Sampler`, `Gauge`, or CPU/Mem panels, it's stale.
+
+The window title is **"NPU Power and Temperature Monitoring GUI"**.
 
 Build with CMake; run `./build/mb-powermon` (needs a display).
 
@@ -45,7 +50,12 @@ Clean split between data and UI — keep it that way.
   the polyline into gaps. `vexpand` so graphs grow with the window.
 - **`MainWindow`** (`src/MainWindow.{h,cpp}`) — builds the two `Gtk::Expander`
   sections, the device-grouped legend, the teal `Gtk::HeaderBar`, and the 1 Hz
-  `Glib::signal_timeout` that pushes samples and updates labels.
+  `Glib::signal_timeout` that pushes samples and updates labels. The shared
+  legend builder (`build_metric_section`) optionally emits a per-device
+  **aggregate** label (`AggEntry` = label + metric `[start,count)` range) after
+  the device name; the tick fills it in — **mean** for temperature, **max** for
+  power — skipping `NaN`. Power aggregates over *all* of a device's power metrics,
+  so a future INA228 reading joins the max automatically.
 - **`util.h`** — the brand palette (accent + neutral), size/rate formatting,
   `nice_ceil`, and `make_palette` (returns **accent colors**, cycled).
 
@@ -66,10 +76,11 @@ the graphs/legend automatically — the UI is metric-agnostic.
   for fills). Neutral = graph chrome (Slate Gray grid/text, `#FAFAFA` plot bg —
   intentionally the original near-white, not pure white). Title bar = Teal via an
   app-scoped `Gtk::CssProvider`. Don't reintroduce ad-hoc RGB.
-- **Legend** is one row per device: `<bdf> <b>Name</b>` then the device's
-  swatch+shortlabel+value entries in aligned grid columns (device prefix stripped
-  from each label). Keep `value_labels_out` in metric order for the tick to
-  update.
+- **Legend** is one row per device: `<bdf> <b>Name</b>`, then the optional
+  per-device aggregate (`avg`/`max`, a dim label at grid column 1), then the
+  device's swatch+shortlabel+value entries in aligned grid columns (device prefix
+  stripped from each label). Keep `value_labels_out` in metric order for the tick
+  to update; the aggregate labels ride in a parallel `AggEntry` vector.
 - Refresh cadence / history are the `k*` constants at the top of
   `MainWindow.cpp` (`kIntervalMs`, `kSpanSeconds`, `kHistory = span + 1`,
   `kTempAxisMax = 100`). Power axis floor is `set_min_axis_max(10.0)`.

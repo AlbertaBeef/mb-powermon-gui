@@ -42,12 +42,12 @@ std::string fmt_temp_axis(double v) {
 }  // namespace
 
 MainWindow::MainWindow() {
-    set_title("mb-powermon-gui - Power Monitor GUI");
+    set_title("NPU Power and Temperature Monitoring GUI");
     set_default_size(940, 620);
 
     // Teal title bar (brand Primary), white title text.
     auto* header = Gtk::make_managed<Gtk::HeaderBar>();
-    auto* title = Gtk::make_managed<Gtk::Label>("mb-powermon-gui - Power Monitor GUI");
+    auto* title = Gtk::make_managed<Gtk::Label>("NPU Power and Temperature Monitoring GUI");
     title->add_css_class("title");
     header->set_title_widget(*title);
     set_titlebar(*header);
@@ -82,14 +82,16 @@ MainWindow::MainWindow() {
                              "No power source available. On these M.2 cards "
                              "power comes only from the Hailo firmware session "
                              "or the MemryX SDK — or an external meter "
-                             "(INA228 / PMD2).")));
+                             "(INA228 / PMD2).",
+                             &power_max_labels_)));
 
     root->append(make_section(
         "Temperature",
         build_metric_section(probes_.temp_metrics(),
                              colors_for(probes_.temp_metrics()),
                              /*percent_temp_axis=*/true, fmt_temp, temp_graph_,
-                             temp_values_, "No temperature sensors detected.")));
+                             temp_values_, "No temperature sensors detected.",
+                             &temp_avg_labels_)));
 
     Glib::signal_timeout().connect(sigc::mem_fun(*this, &MainWindow::on_tick),
                                    kIntervalMs);
@@ -131,7 +133,7 @@ Gtk::Widget& MainWindow::build_metric_section(
     const std::vector<MetricInfo>& metrics, const std::vector<Gdk::RGBA>& colors,
     bool temp_axis, std::function<std::string(double)> value_fmt,
     GraphArea*& graph_out, std::vector<Gtk::Label*>& value_labels_out,
-    const char* empty_note) {
+    const char* empty_note, std::vector<AggEntry>* agg_out) {
     auto* box = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 8);
     box->set_vexpand(true);  // graph inside grows; legend keeps natural height
 
@@ -182,6 +184,18 @@ Gtk::Widget& MainWindow::build_metric_section(
         grid->attach(*dn, 0, row, 1, 1);
 
         int col = 1;
+        // Optional per-device aggregate, between the name and the metric entries.
+        const int agg_start = i;
+        Gtk::Label* agg_label = nullptr;
+        if (agg_out) {
+            agg_label = Gtk::make_managed<Gtk::Label>("—");
+            agg_label->set_xalign(0.0);
+            agg_label->set_margin_end(6);
+            agg_label->add_css_class("dim-label");
+            grid->attach(*agg_label, col, row, 1, 1);
+            ++col;
+        }
+
         while (i < n && metrics[i].device == dev) {
             auto* cell =
                 Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 6);
@@ -222,6 +236,7 @@ Gtk::Widget& MainWindow::build_metric_section(
             ++col;
             ++i;
         }
+        if (agg_out) agg_out->push_back({agg_label, agg_start, i - agg_start});
         ++row;
     }
     box->append(*grid);
@@ -241,6 +256,18 @@ bool MainWindow::on_tick() {
         temp_graph_->push(tv);
         for (size_t i = 0; i < temp_values_.size() && i < tv.size(); ++i)
             temp_values_[i]->set_text(fmt_temp(tv[i]));
+        for (const auto& a : temp_avg_labels_) {
+            double sum = 0.0;
+            int cnt = 0;
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(tv.size()); ++k) {
+                if (!std::isnan(tv[k])) {
+                    sum += tv[k];
+                    ++cnt;
+                }
+            }
+            a.label->set_text(cnt ? "avg " + fmt_temp(sum / cnt) : "avg —");
+        }
     }
 
     const auto& pv = probes_.power_values();
@@ -249,6 +276,16 @@ bool MainWindow::on_tick() {
         power_graph_->push(pv);
         for (size_t i = 0; i < power_values_.size() && i < pv.size(); ++i)
             power_values_[i]->set_text(fmt_power(pv[i]));
+        for (const auto& a : power_max_labels_) {
+            double best = std::nan("");
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(pv.size()); ++k) {
+                if (!std::isnan(pv[k]) && (std::isnan(best) || pv[k] > best))
+                    best = pv[k];
+            }
+            a.label->set_text(std::isnan(best) ? "max —"
+                                               : "max " + fmt_power(best));
+        }
     }
 
     return true;
