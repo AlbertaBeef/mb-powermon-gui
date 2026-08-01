@@ -79,10 +79,11 @@ MainWindow::MainWindow() {
                              colors_for(probes_.power_metrics()),
                              /*percent_temp_axis=*/false, fmt_power, power_graph_,
                              power_values_,
-                             "No power source available. On these M.2 cards "
-                             "power comes only from the Hailo firmware session "
-                             "or the MemryX SDK — or an external meter "
-                             "(INA228 / PMD2).",
+                             "No power source available. On the M.2 cards power "
+                             "comes only from the Hailo firmware session or the "
+                             "MemryX SDK; SoC-integrated NPUs (Qualcomm IQ) have "
+                             "no current sensing at all. Otherwise it takes an "
+                             "external meter (INA228 / PMD2).",
                              &power_max_labels_)));
 
     root->append(make_section(

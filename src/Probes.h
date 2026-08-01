@@ -2,7 +2,8 @@
 //
 // "Passive" = never claims a device or perturbs another application's use of
 // it: DeepX via `dxrt-cli -s` (reads the kernel driver), MemryX via sysfs/hwmon,
-// Axelera via `triton_trace --peek` (reads the collector log, no Context claim).
+// Axelera via `triton_trace --peek` (reads the collector log, no Context claim),
+// Qualcomm IQ via the `nsp-*-thermal` sysfs zones.
 // No GTK dependency — pure data, mirroring the Python mb-powermon probes.
 #pragma once
 
@@ -18,7 +19,9 @@ struct MetricInfo {
     std::string unit;         // "°C" or "W"
     int device = -1;          // filled during discovery
     std::string device_name;  // "Hailo", "DeepX", ...
-    std::string bdf;          // PCIe BDF, e.g. "0000:01:00.0"
+    // PCIe BDF, e.g. "0000:01:00.0". For an SoC-integrated NPU there is no BDF,
+    // so this carries an equivalent locator instead (e.g. the SoC id "QCS9075").
+    std::string bdf;
 };
 
 // A single device's telemetry source.

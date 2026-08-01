@@ -6,7 +6,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if MB_HAVE_HAILO
 #include <hailo/hailort.hpp>
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -71,6 +73,7 @@ std::string run_capture(const std::string& cmd) {
     return out;
 }
 
+#if MB_HAVE_HAILO
 // ---------------------------------------------------------------------------
 // Hailo-8 — TS0/TS1 + firmware-averaged power via the HailoRT C++ runtime API.
 // Temperature reads are passive; the power session is *not* — it uses the
@@ -151,6 +154,7 @@ private:
     bool has_power_ = false;
     int power_fail_ = 0;
 };
+#endif  // MB_HAVE_HAILO
 
 // ---------------------------------------------------------------------------
 // DeepX M1 — `dxrt-cli -s`, per-NPU temperature lines (reads the kernel driver;
@@ -404,6 +408,93 @@ private:
     std::string cli_, device_;
 };
 
+// ---------------------------------------------------------------------------
+// Qualcomm Dragonwing IQ (IQ-9075 EVK / QCS9075 and relatives) — the NPU here is
+// the SoC's own Hexagon NSP, not an M.2 card, so there is no PCIe device and no
+// vendor runtime to ask. Temperatures come straight from the kernel's TSENS
+// thermal zones (`nsp-<instance>-<block>-<sensor>-thermal`), which is as passive
+// as telemetry gets.
+//
+// Zone naming on this part is nsp-A-B-C: A = NSP instance, B = block within it,
+// C = one of two redundant TSENS taps on the same block (they track within a
+// degree of each other). We collapse each A/B pair to its **max** and expose one
+// metric per block, so a 2x3x2 = 12-zone SoC reads as 6 legend entries.
+//
+// No power: this board exposes no current sensing anywhere in sysfs — no hwmon
+// power*/curr* input, no shunt monitor in the device tree, no powercap/RAPL, and
+// the PMIC VADC offers die temperatures and vph_pwr voltage but no current. The
+// NSP also shares the package rail with CPU/GPU, so even a package-level number
+// would not be an NPU number. Power for this device needs external
+// instrumentation (INA228 / PMD2), which this probe deliberately does not fake.
+// ---------------------------------------------------------------------------
+class QualcommIQProbe : public DeviceProbe {
+public:
+    const char* name() const override { return name_.c_str(); }
+
+    bool discover() {
+        // Group the nsp-A-B-C zones by (instance, block); C is a redundant tap.
+        static const std::regex re(R"(^nsp-(\d+)-(\d+)-(\d+)-thermal$)");
+        std::map<std::pair<int, int>, std::vector<std::string>> blocks;
+        for (const auto& z : glob_paths("/sys/class/thermal/thermal_zone*")) {
+            std::string type = trimmed(read_file(z + "/type"));
+            std::smatch m;
+            if (!std::regex_match(type, m, re)) continue;
+            blocks[{std::stoi(m[1]), std::stoi(m[2])}].push_back(z + "/temp");
+        }
+        if (blocks.empty()) return false;
+
+        name_ = board_name();
+        bdf_ = trimmed(read_file("/sys/devices/soc0/machine"));  // e.g. "QCS9075"
+
+        for (auto& [key, paths] : blocks) {
+            char lbl[16];
+            std::snprintf(lbl, sizeof(lbl), "N%d-%d", key.first, key.second);
+            temp_metrics_.push_back({name_ + " " + lbl, "°C"});
+            zones_.push_back(std::move(paths));
+        }
+        temp_values_.assign(temp_metrics_.size(), kNaN);
+        poll();
+        return true;
+    }
+
+    void poll() override {
+        for (size_t i = 0; i < zones_.size(); ++i) {
+            double best = kNaN;
+            for (const auto& p : zones_[i]) {
+                std::string raw = read_file(p);
+                if (raw.empty()) continue;
+                try {
+                    double c = std::stod(raw) / 1000.0;
+                    if (std::isnan(best) || c > best) best = c;
+                } catch (...) {
+                }
+            }
+            temp_values_[i] = best;
+        }
+    }
+
+private:
+    static std::string trimmed(std::string s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || !s.back()))
+            s.pop_back();
+        return s;
+    }
+
+    // "Qualcomm Technologies, Inc. Addons IQ 9075 EVK" -> "IQ9075". Falls back to
+    // the SoC id ("QCS9075") and finally to a generic name.
+    static std::string board_name() {
+        std::string model = trimmed(read_file("/proc/device-tree/model"));
+        std::smatch m;
+        static const std::regex re(R"(\b(IQ|QCS|QRB|SA)[- ]?(\d{4}[A-Z]?)\b)");
+        if (std::regex_search(model, m, re)) return m[1].str() + m[2].str();
+        std::string soc = trimmed(read_file("/sys/devices/soc0/machine"));
+        return soc.empty() ? "Qualcomm" : soc;
+    }
+
+    std::string name_ = "Qualcomm";
+    std::vector<std::vector<std::string>> zones_;  // per metric: redundant taps
+};
+
 }  // namespace
 
 void Probes::discover(std::vector<std::string>* notes) {
@@ -419,11 +510,13 @@ void Probes::discover(std::vector<std::string>* notes) {
         }
     };
 
+#if MB_HAVE_HAILO
     {
         auto p = std::make_unique<HailoProbe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }
+#endif
     {
         auto p = std::make_unique<DeepXProbe>();
         bool ok = p->discover();
@@ -436,6 +529,11 @@ void Probes::discover(std::vector<std::string>* notes) {
     }
     {
         auto p = std::make_unique<AxeleraProbe>();
+        bool ok = p->discover();
+        try_add(std::move(p), ok);
+    }
+    {
+        auto p = std::make_unique<QualcommIQProbe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }
