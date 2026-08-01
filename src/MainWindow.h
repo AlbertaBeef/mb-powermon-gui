@@ -4,6 +4,7 @@
 #pragma once
 
 #include <gdkmm/rgba.h>
+#include <gtkmm/aboutdialog.h>
 #include <gtkmm/applicationwindow.h>
 #include <gtkmm/expander.h>
 #include <gtkmm/label.h>
@@ -23,6 +24,7 @@ public:
 
 private:
     bool on_tick();
+    void on_about();  // shows the About dialog (branded with the embedded logo)
 
     // A per-device aggregate label spanning metrics [start, start+count) in the
     // aligned value vector, so the tick can recompute the device's summary
@@ -55,6 +57,8 @@ private:
 
     Probes probes_;
     std::int64_t last_time_us_ = 0;
+    Gtk::AboutDialog about_dialog_;
+    bool about_ready_ = false;  // configured lazily on first open
 
     GraphArea* power_graph_ = nullptr;
     std::vector<Gtk::Label*> power_values_;

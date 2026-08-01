@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Assets compiled into the binary (see CMakeLists.txt). Access at runtime via
+     Gdk::Texture::create_from_resource("/com/mariobergeron/mbpowermon/<alias>"). -->
+<gresources>
+  <gresource prefix="/com/mariobergeron/mbpowermon">
+    <file alias="M_benchmarking.png">assets/M_benchmarking.png</file>
+  </gresource>
+</gresources>

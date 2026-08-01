@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!--
+    M_benchmarking.svg — benchmarking variant.
+    Sequence (11s loop):
+      0–0.5s   hold standard M
+      0.5–1.5s M collapses: verticals shrink to points at y=48;
+                V apex drops and V endpoints converge to (32, 48).
+                [ease-in, gravity feel]
+      1.5–2.5s 3 bars rise to RUN 1: tops at y=33 / y=28 / y=18
+                (short / medium / tall). Middle bar emerges at x=32
+                (no via) — visually flagged as the "test subject"
+                being benchmarked. [ease-out]
+      2.5–3.5s morph to RUN 2: y=23 / y=33 / y=28 [ease-in-out]
+      3.5–4.5s morph to RUN 3: y=28 / y=23 / y=33 [ease-in-out]
+      4.5–5.5s morph to RUN 4: y=18 / y=28 / y=23 [ease-in-out]
+      5.5–6.5s morph to RUN 5: y=23 / y=18 / y=28 [ease-in-out]
+      6.5–7.5s morph to RUN 6 / final: y=33 / y=18 / y=23
+                (short / tall / medium). Centre tallest = "podium win".
+                [ease-in-out]
+      7.5–11s  hold final ranking; loop reset back to standard M
+
+    Path structure: 3 sub-paths, command structure constant across all
+    keyframes — M L M L M L L (7 commands, 7 points).
+      Sub-path 1 (M L)   : left bar / left M-vertical
+      Sub-path 2 (M L)   : right bar / right M-vertical
+      Sub-path 3 (M L L) : middle bar (collinear polyline at x=32)
+                           / V-shape in M-mode
+
+    Vias at (18, 48) and (46, 48) stay anchored to the left and right
+    bar feet. The middle bar has no via — that asymmetry is what
+    visually flags it as the candidate being benchmarked.
+  -->
+
+  <defs>
+    <clipPath id="substrate-clip">
+      <circle cx="32" cy="32" r="30"/>
+    </clipPath>
+  </defs>
+
+  <!-- substrate (teal circle) -->
+  <circle cx="32" cy="32" r="30" fill="#64a19d"/>
+
+  <g clip-path="url(#substrate-clip)">
+    <path fill="none" stroke="#fff" stroke-width="6"
+          stroke-linecap="round" stroke-linejoin="round"
+          d="M 18 48 L 18 18 M 46 48 L 46 18 M 18 18 L 32 38 L 46 18">
+      <animate attributeName="d"
+               dur="11s" repeatCount="indefinite"
+               calcMode="spline"
+               keySplines="0 0 1 1;
+                           0.7 0 1 1;
+                           0 0 0.4 1;
+                           0.4 0 0.6 1;
+                           0.4 0 0.6 1;
+                           0.4 0 0.6 1;
+                           0.4 0 0.6 1;
+                           0.4 0 0.6 1;
+                           0 0 1 1"
+               keyTimes="0;
+                         0.04545;
+                         0.13636;
+                         0.22727;
+                         0.31818;
+                         0.40909;
+                         0.5;
+                         0.59091;
+                         0.68182;
+                         1"
+               values="M 18 48 L 18 18 M 46 48 L 46 18 M 18 18 L 32 38 L 46 18;
+                       M 18 48 L 18 18 M 46 48 L 46 18 M 18 18 L 32 38 L 46 18;
+                       M 18 48 L 18 48 M 46 48 L 46 48 M 32 48 L 32 48 L 32 48;
+                       M 18 48 L 18 33 M 46 48 L 46 18 M 32 48 L 32 38 L 32 28;
+                       M 18 48 L 18 23 M 46 48 L 46 28 M 32 48 L 32 40 L 32 33;
+                       M 18 48 L 18 28 M 46 48 L 46 33 M 32 48 L 32 36 L 32 23;
+                       M 18 48 L 18 18 M 46 48 L 46 23 M 32 48 L 32 38 L 32 28;
+                       M 18 48 L 18 23 M 46 48 L 46 28 M 32 48 L 32 33 L 32 18;
+                       M 18 48 L 18 33 M 46 48 L 46 23 M 32 48 L 32 33 L 32 18;
+                       M 18 48 L 18 33 M 46 48 L 46 23 M 32 48 L 32 33 L 32 18"/>
+    </path>
+
+    <!-- Vias at the left and right bar feet -->
+    <circle cx="18" cy="48" r="4.5" fill="#fff"/>
+    <circle cx="18" cy="48" r="2"   fill="#64a19d"/>
+    <circle cx="46" cy="48" r="4.5" fill="#fff"/>
+    <circle cx="46" cy="48" r="2"   fill="#64a19d"/>
+  </g>
+</svg>

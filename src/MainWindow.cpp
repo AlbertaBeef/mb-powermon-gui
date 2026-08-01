@@ -3,7 +3,10 @@
 #include <glib.h>
 #include <glibmm/main.h>
 #include <gdkmm/display.h>
+#include <gdkmm/texture.h>
+#include <gtkmm/aboutdialog.h>
 #include <gtkmm/box.h>
+#include <gtkmm/button.h>
 #include <gtkmm/cssprovider.h>
 #include <gtkmm/drawingarea.h>
 #include <gtkmm/grid.h>
@@ -50,6 +53,15 @@ MainWindow::MainWindow() {
     auto* title = Gtk::make_managed<Gtk::Label>("NPU Power and Temperature Monitoring GUI");
     title->add_css_class("title");
     header->set_title_widget(*title);
+
+    // About button (right side of the header) — opens the branded About dialog.
+    auto* about_btn = Gtk::make_managed<Gtk::Button>();
+    about_btn->set_icon_name("help-about-symbolic");
+    about_btn->set_tooltip_text("About");
+    about_btn->add_css_class("flat");
+    about_btn->signal_clicked().connect(
+        sigc::mem_fun(*this, &MainWindow::on_about));
+    header->pack_end(*about_btn);
     set_titlebar(*header);
 
     auto css = Gtk::CssProvider::create();
@@ -290,4 +302,31 @@ bool MainWindow::on_tick() {
     }
 
     return true;
+}
+
+void MainWindow::on_about() {
+    // Configure once; thereafter just re-show the same (hidden) dialog.
+    if (!about_ready_) {
+        about_ready_ = true;
+        about_dialog_.set_transient_for(*this);
+        about_dialog_.set_modal(true);
+        about_dialog_.set_hide_on_close(true);
+        about_dialog_.set_program_name(
+            "NPU Power and Temperature Monitoring GUI");
+        about_dialog_.set_version("1.0");
+        about_dialog_.set_comments(
+            "Monitors the power and temperature of edge-AI NPUs — Hailo, "
+            "DeepX, MemryX, and Axelera — as live scrolling graphs.");
+        about_dialog_.set_copyright("© 2026 Mario Bergeron");
+        about_dialog_.set_license_type(Gtk::License::APACHE_2_0);
+        about_dialog_.set_website("https://mariobergeron.com");
+        about_dialog_.set_website_label("mariobergeron.com");
+        try {
+            about_dialog_.set_logo(Gdk::Texture::create_from_resource(
+                "/com/mariobergeron/mbpowermon/M_benchmarking.png"));
+        } catch (const Glib::Error& e) {
+            g_warning("about logo: %s", e.what());
+        }
+    }
+    about_dialog_.set_visible(true);
 }

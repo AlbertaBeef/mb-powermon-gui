@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=NPU Power & Temperature Monitor
+GenericName=NPU Power Monitor
+Comment=Monitor power and temperature of edge-AI NPUs
+Exec=/media/abbeefepyc/Nauvoo/shared_with_docker/mb-powermon-gui/build/mb-powermon
+Icon=M_logo
+Terminal=false
+Categories=System;Monitor;
+Keywords=NPU;power;temperature;Hailo;DeepX;MemryX;Axelera;telemetry;
+StartupNotify=true
+StartupWMClass=mb-powermon
