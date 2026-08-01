@@ -36,9 +36,53 @@ is added alongside the on-card source, the label reports the highest of them.
 | **MemryX MX3** | `T0`–`T3` via sysfs/hwmon | `POW` via the MemryX SDK over the `mxa-manager` daemon | ✅ (daemon-shared) |
 | **Axelera Metis** | `SYS` / `AI0`–`AI3` via `triton_trace --peek` | — (not exposed on M.2) | ✅ |
 | **Qualcomm IQ** (IQ-9075 / QCS9075) | `N0-0`–`N1-2` via the `nsp-*-thermal` sysfs zones | — (**no** power measurement exists on the board) | ✅ |
+| **IQ9075 Board** (ambient) | `AMB` via a TI TMP411 on i2c-19 0x4c (hwmon `temp1_input`) | — | ✅ |
 
 Devices are auto-discovered at startup; only what's present appears. Whatever a
 card doesn't expose simply doesn't get a trace.
+
+### Enabling the IQ-9075 board ambient sensor
+
+The EVK carries a **TI TMP411** at `i2c-19 0x4c` (sharing that bus with the
+`amc6821` fan controller) that no IQ-9075 device tree declares, so nothing binds
+it and it exposes no hwmon by default. Instantiate it once and the `IQ9075 Board`
+row appears; skip this and the probe simply contributes no row.
+
+```bash
+sudo modprobe tmp401
+echo "tmp411 0x4c" | sudo tee /sys/bus/i2c/devices/i2c-19/new_device
+```
+
+That lasts until reboot. To make it persistent:
+
+```bash
+sudo tee /etc/systemd/system/tmp411-board-sensor.service >/dev/null <<'EOF'
+[Unit]
+Description=Instantiate the IQ-9075 board ambient sensor (TMP411, i2c-19 0x4c)
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe tmp401
+ExecStart=/bin/sh -c 'echo "tmp411 0x4c" > /sys/bus/i2c/devices/i2c-19/new_device'
+ExecStop=/bin/sh -c 'echo 0x4c > /sys/bus/i2c/devices/i2c-19/delete_device'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl enable --now tmp411-board-sensor.service
+```
+
+Undo at any time with
+`echo 0x4c | sudo tee /sys/bus/i2c/devices/i2c-19/delete_device`.
+
+This is **board** temperature, not NPU die temperature, so it gets its own legend
+row and its own `avg` — folding it into the NPU row would drag that average
+toward ambient. The chip also has a valid remote-diode channel (`temp2`, ~65 °C,
+`temp2_fault=0`), but what that diode is wired to can't be determined without the
+board schematic, so it is deliberately not exposed rather than labelled with a
+guess.
 
 ### Why the Qualcomm IQ has no power row
 

@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-project(mb-powermon-gui LANGUAGES CXX)
+# C is needed only for the glib-compile-resources output (a generated .c file).
+project(mb-powermon-gui LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,11 +26,30 @@ else()
   message(STATUS "libhailort not found — building without Hailo-8 support")
 endif()
 
+# Compile assets/ into the binary as a GResource. The About dialog loads its logo
+# with Gdk::Texture::create_from_resource(), which finds nothing unless this runs.
+find_program(GLIB_COMPILE_RESOURCES glib-compile-resources REQUIRED)
+set(GRESOURCE_XML ${CMAKE_CURRENT_SOURCE_DIR}/mb-powermon-gui.gresource.xml)
+set(GRESOURCE_C ${CMAKE_CURRENT_BINARY_DIR}/mb-powermon-gui.gresource.c)
+execute_process(
+  COMMAND ${GLIB_COMPILE_RESOURCES} --generate-dependencies
+          --sourcedir=${CMAKE_CURRENT_SOURCE_DIR} ${GRESOURCE_XML}
+  OUTPUT_VARIABLE GRESOURCE_DEPS OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(REPLACE "\n" ";" GRESOURCE_DEPS "${GRESOURCE_DEPS}")  # already absolute
+add_custom_command(
+  OUTPUT ${GRESOURCE_C}
+  COMMAND ${GLIB_COMPILE_RESOURCES} --target=${GRESOURCE_C} --generate-source
+          --sourcedir=${CMAKE_CURRENT_SOURCE_DIR} ${GRESOURCE_XML}
+  DEPENDS ${GRESOURCE_XML} ${GRESOURCE_DEPS}
+  COMMENT "Compiling GResource bundle"
+  VERBATIM)
+
 add_executable(mb-powermon
   src/main.cpp
   src/Probes.cpp
   src/GraphArea.cpp
   src/MainWindow.cpp
+  ${GRESOURCE_C}
 )
 
 target_include_directories(mb-powermon PRIVATE src)

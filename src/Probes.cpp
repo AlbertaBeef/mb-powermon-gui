@@ -10,6 +10,7 @@
 #include <hailo/hailort.hpp>
 #endif
 
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,24 @@ std::vector<std::string> glob_paths(const std::string& pattern) {
 std::string basename_of(const std::string& p) {
     auto s = p.find_last_of('/');
     return s == std::string::npos ? p : p.substr(s + 1);
+}
+
+// Strip trailing newline / space / NUL — sysfs strings and device-tree strings
+// respectively.
+std::string trim_sysfs(std::string s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || !s.back()))
+        s.pop_back();
+    return s;
+}
+
+// Short board name for an SoC platform: "Qualcomm Technologies, Inc. Addons IQ
+// 9075 EVK" -> "IQ9075". Falls back to the SoC id ("QCS9075"), then to "".
+std::string board_name() {
+    std::string model = trim_sysfs(read_file("/proc/device-tree/model"));
+    std::smatch m;
+    static const std::regex re(R"(\b(IQ|QCS|QRB|SA)[- ]?(\d{4}[A-Z]?)\b)");
+    if (std::regex_search(model, m, re)) return m[1].str() + m[2].str();
+    return trim_sysfs(read_file("/sys/devices/soc0/machine"));
 }
 
 // Full PCIe BDF (e.g. "0000:47:00.0") of the first device with this vendor id.
@@ -436,7 +455,7 @@ public:
         static const std::regex re(R"(^nsp-(\d+)-(\d+)-(\d+)-thermal$)");
         std::map<std::pair<int, int>, std::vector<std::string>> blocks;
         for (const auto& z : glob_paths("/sys/class/thermal/thermal_zone*")) {
-            std::string type = trimmed(read_file(z + "/type"));
+            std::string type = trim_sysfs(read_file(z + "/type"));
             std::smatch m;
             if (!std::regex_match(type, m, re)) continue;
             blocks[{std::stoi(m[1]), std::stoi(m[2])}].push_back(z + "/temp");
@@ -444,7 +463,8 @@ public:
         if (blocks.empty()) return false;
 
         name_ = board_name();
-        bdf_ = trimmed(read_file("/sys/devices/soc0/machine"));  // e.g. "QCS9075"
+        if (name_.empty()) name_ = "Qualcomm";
+        bdf_ = trim_sysfs(read_file("/sys/devices/soc0/machine"));  // "QCS9075"
 
         for (auto& [key, paths] : blocks) {
             char lbl[16];
@@ -474,25 +494,84 @@ public:
     }
 
 private:
-    static std::string trimmed(std::string s) {
-        while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || !s.back()))
-            s.pop_back();
-        return s;
-    }
-
-    // "Qualcomm Technologies, Inc. Addons IQ 9075 EVK" -> "IQ9075". Falls back to
-    // the SoC id ("QCS9075") and finally to a generic name.
-    static std::string board_name() {
-        std::string model = trimmed(read_file("/proc/device-tree/model"));
-        std::smatch m;
-        static const std::regex re(R"(\b(IQ|QCS|QRB|SA)[- ]?(\d{4}[A-Z]?)\b)");
-        if (std::regex_search(model, m, re)) return m[1].str() + m[2].str();
-        std::string soc = trimmed(read_file("/sys/devices/soc0/machine"));
-        return soc.empty() ? "Qualcomm" : soc;
-    }
-
     std::string name_ = "Qualcomm";
     std::vector<std::vector<std::string>> zones_;  // per metric: redundant taps
+};
+
+// ---------------------------------------------------------------------------
+// Board ambient — a TMP401-family remote/local temperature sensor (TI TMP411 on
+// the IQ-9075 EVK, i2c-19 0x4c, sharing that bus with the amc6821 fan
+// controller). This is *board* temperature, not NPU die temperature, so it is a
+// separate DeviceProbe: it earns its own legend row and its own `avg`, rather
+// than dragging the NSP average toward ambient.
+//
+// Only the sensor's **local** channel (temp1 = the chip's own die = board
+// ambient) is exposed. TMP411 also has a valid remote-diode channel (temp2,
+// ~65 °C here, temp2_fault=0), but what that diode is wired to isn't knowable
+// without the board schematic, so it is deliberately left out rather than
+// labelled with a guess.
+//
+// The chip is absent from every IQ-9075 device tree, so nothing binds it
+// automatically — it must be instantiated once (see README). Until then this
+// probe finds nothing and simply contributes no row. Reads here are plain sysfs;
+// the one-time config write belongs to the in-tree tmp401 driver at bind, not to
+// us, so per-tick behaviour stays passive.
+// ---------------------------------------------------------------------------
+class BoardThermalProbe : public DeviceProbe {
+public:
+    const char* name() const override { return name_.c_str(); }
+
+    bool discover() {
+        static const char* kFamily[] = {"tmp411", "tmp401", "tmp431", "tmp432",
+                                        "tmp435"};
+        for (const auto& d : glob_paths("/sys/class/hwmon/hwmon*")) {
+            std::string nm = trim_sysfs(read_file(d + "/name"));
+            bool known = false;
+            for (const char* f : kFamily) known |= (nm == f);
+            if (!known) continue;
+            std::string p = d + "/temp1_input";
+            if (read_file(p).find_first_of("0123456789") == std::string::npos)
+                continue;
+            path_ = p;
+            // The i2c client this hwmon hangs off is named "<bus>-<addr>", e.g.
+            // "19-004c" -> the locator "i2c-19 0x4c" for the legend.
+            std::string node = basename_of(realpath_of(d + "/device"));
+            unsigned bus = 0, addr = 0;
+            if (std::sscanf(node.c_str(), "%u-%x", &bus, &addr) == 2) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "i2c-%u 0x%02x", bus, addr);
+                bdf_ = buf;
+            }
+            break;
+        }
+        if (path_.empty()) return false;
+
+        std::string board = board_name();
+        name_ = board.empty() ? "Board" : board + " Board";
+        temp_metrics_.push_back({name_ + " AMB", "°C"});
+        temp_values_.assign(1, kNaN);
+        poll();
+        return true;
+    }
+
+    void poll() override {
+        std::string raw = read_file(path_);
+        try {
+            temp_values_[0] = raw.empty() ? kNaN : std::stod(raw) / 1000.0;
+        } catch (...) {
+            temp_values_[0] = kNaN;
+        }
+    }
+
+private:
+    static std::string realpath_of(const std::string& p) {
+        char buf[PATH_MAX];
+        const char* r = realpath(p.c_str(), buf);
+        return r ? std::string(r) : std::string();
+    }
+
+    std::string name_ = "Board";
+    std::string path_;
 };
 
 }  // namespace
@@ -534,6 +613,11 @@ void Probes::discover(std::vector<std::string>* notes) {
     }
     {
         auto p = std::make_unique<QualcommIQProbe>();
+        bool ok = p->discover();
+        try_add(std::move(p), ok);
+    }
+    {
+        auto p = std::make_unique<BoardThermalProbe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }

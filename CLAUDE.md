@@ -57,6 +57,16 @@ Clean split between data and UI — keep it that way.
     (`… Addons IQ 9075 EVK` → `IQ9075`); `bdf_` carries the SoC id from
     `/sys/devices/soc0/machine` (`QCS9075`) since there is no PCIe device.
     **No power** — see gotchas.
+  - **BoardThermalProbe** — board *ambient*, from a TMP401-family chip's hwmon
+    `temp1_input` (TI TMP411 at i2c-19 0x4c on the IQ-9075). Kept a **separate
+    DeviceProbe on purpose**: it is board temperature, not NPU die temperature, so
+    it earns its own legend row and its own `avg` instead of dragging the NSP
+    average toward ambient. `bdf_` is the i2c locator (`i2c-19 0x4c`). Only the
+    local channel is exposed — `temp2` (remote diode, ~65 °C, `temp2_fault=0`, so
+    genuinely connected) is left out because what it measures is unknowable
+    without the schematic. Nothing binds this chip automatically (absent from
+    every IQ-9075 DTB); it needs a one-time `new_device` instantiation, and until
+    then the probe finds nothing and contributes no row — verified.
 - **`GraphArea`** (`src/GraphArea.{h,cpp}`) — reusable Cairo `DrawingArea`.
   Percent / fixed-max (°C) / auto-scale (W, nice-rounded, `min_axis_max` floor)
   modes; axis labels at 0/25/50/75/100 %; newest sample on the right; NaN breaks
