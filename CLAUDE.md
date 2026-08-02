@@ -11,9 +11,11 @@ Monitor** (Resources tab). It is the GUI counterpart to the sibling Python TUI i
 share the theme but **no code**.
 
 Coverage is no longer identical: the GUI has a **Qualcomm IQ** (on-SoC Hexagon
-NSP) probe that the TUI lacks, and the TUI has external-meter probes (**PMD2**,
-**INA228** over FT232H) that the GUI lacks. Port in either direction as needed —
-but note the two have no shared code, so it is a reimplementation, not a move.
+NSP) probe that the TUI lacks, and both now read **INA228** external power over an
+FT232H bridge (the GUI via **libftdi1** in C++, the TUI via Adafruit Blinka in
+Python — no shared code). The TUI still has a **PMD2** meter probe the GUI lacks.
+Port in either direction as needed — the two have no shared code, so it is a
+reimplementation, not a move.
 
 The UI is deliberately simple: **two sections, Power and Temperature**, each a
 scrolling 60 s time-series graph with a per-device legend of live values. Each
@@ -67,6 +69,16 @@ Clean split between data and UI — keep it that way.
     without the schematic. Nothing binds this chip automatically (absent from
     every IQ-9075 DTB); it needs a one-time `new_device` instantiation, and until
     then the probe finds nothing and contributes no row — verified.
+  - **INA228Probe** — external reference-grade rail power from an **INA228** on an
+    **FT232H** USB→I²C bridge (`libftdi1` MPSSE bit-banged I²C — behind
+    `#if MB_HAVE_FTDI`, compiled out when libftdi1 is absent). One probe per
+    bridge; `Probes::discover()` enumerates every `0403:6014` via sysfs and opens
+    each by libusb **bus/address** (`ftdi_usb_open_bus_addr`). The `Ft232hI2c` +
+    `Ina228` classes are lifted verbatim from `envic_ai_cpp`'s hardware-validated
+    `mb_power_smoke`; defaults mirror the Python TUI (15 mΩ shunt, 5 A full-scale,
+    canonical addresses `{0x40,0x41,0x44,0x45}`, one `POW` W metric per sensor).
+    **POWER register is full 24-bit — no `>>4`** (unlike VBUS/VSHUNT/CURRENT). See
+    gotchas for the identity problem.
 - **`GraphArea`** (`src/GraphArea.{h,cpp}`) — reusable Cairo `DrawingArea`.
   Percent / fixed-max (°C) / auto-scale (W, nice-rounded, `min_axis_max` floor)
   modes; axis labels at 0/25/50/75/100 %; newest sample on the right; NaN breaks
@@ -121,8 +133,26 @@ the graphs/legend automatically — the UI is metric-agnostic.
   persistent. Interpreter search: `$MB_MEMRYX_PYTHON`, then
   `$HOME/mb-edgeai/memryx-env` (validated by a fast stat of its `site-packages/memryx`).
 - **Axelera** — device name derives from the `/dev/metis-0:*` node; `triton_trace`
-  is found under `/opt/axelera/runtime-*/bin`. Temps only appear if the collector
-  is already running (we don't enable it — that would flip a global log level).
+  is found under `/opt/axelera/runtime-*/bin`. **Presence is keyed on the node, not
+  on temps:** the probe registers `SYS`/`AI0`–`AI3` (NaN until data flows) whenever
+  the node + tool exist, so a present-but-silent Metis stays in the UI — and `note_`
+  (surfaced in the discovery log via `try_add`) says *why* it's silent. Two
+  independent gates keep temps from appearing, both reset by a reboot:
+  - **App firmware must be loaded.** The card loads its runtime firmware into RAM
+    **on demand** (volatile — lost on reboot; nothing loads it at boot). Idle after a
+    reboot it sits in **bootloader** firmware and `triton_trace`/`axcmd` refuse with
+    `Version mismatch! Actual="v1.3.2+bl1" Expected="v1.7.0"` — the probe parses this
+    into `note_`. Loaded by running any inference, or `axcmd --fwload
+    /opt/axelera/device-*/omega/bin/start_axelera_runtime.elf` (RAM, **not**
+    `--flashload`). `axsystemserver` (the `*:5555` broker) does **not** load it.
+  - **Collector log level must be `inf`** — the firmware only logs `core_temps=` at
+    `inf` (default `err`); `triton_trace --slog-level inf` flips it. That's a *global*
+    level, so the probe stays passive and never does it — `note_` reads "collector
+    idle" in this case.
+
+  So temps "just work" while a Voyager app runs (it loads firmware **and** starts the
+  collector) and vanish when the box is rebooted and left idle. Full recovery recipe:
+  the `mb-axelera` skill's `references/runtime.md`.
 - **Qualcomm IQ** — **there is no power telemetry on this board, and don't invent
   one.** Measured on the IQ-9075 EVK, strongest evidence first:
   - **No power-monitor IC exists on any IQ-9075 variant.** Scanning all 331 DTBs
@@ -173,7 +203,21 @@ the graphs/legend automatically — the UI is metric-agnostic.
   `i2c-tools` and `device-tree-compiler`, both now installed on this host.
 - **BDF** — Hailo from `scan()`; DeepX/MemryX/Axelera from
   `/sys/bus/pci/devices/*/vendor` (0x1ff4 / 0x1fe9 / 0x1f9d). Qualcomm IQ has no
-  PCIe device, so the column carries the SoC id instead.
+  PCIe device, so the column carries the SoC id instead; INA228 (also no PCIe)
+  carries its USB locator (`usb <bus>-<addr>`).
+- **INA228 identity** — the FT232H bridges here have **no USB serial**, and every
+  INA228 sits at the same default address `0x40` on its *own* bus, so neither the
+  USB serial nor the I²C address disambiguates them. Probes are opened by libusb
+  bus/address and named by **enumeration order** (`INA228#0`, `INA228#1`), which is
+  **not stable** across replug/reboot — so do **not** treat `#0` as a fixed
+  accelerator. A config file mapping each bridge to an accelerator is the planned
+  fix; until then the order is best-effort. Runtime prereqs: a udev rule
+  (`ATTRS{idVendor}=="0403", MODE="0666"`) so the raw USB node is user-openable —
+  it applies on the next `add` event (fresh boot / replug), not on already-
+  enumerated devices — and libftdi auto-detaches `ftdi_sio` at open (so
+  `/dev/ttyUSB*` being present is harmless). The `poll()` reads run on the GUI
+  thread (~tens of ms for two sensors over MPSSE at 100 kHz); fine at this scale,
+  move to a worker thread if many bridges are added.
 
 ## Build / verify
 
@@ -182,11 +226,16 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ./build/mb-powermon                       # needs a display (X11/Wayland)
 ```
 
-Requires `gtkmm-4.0`. The HailoRT runtime (`libhailort` +
-`/usr/local/include/hailo`, found via `find_library`/`find_path`) is **optional**:
-CMake sets `MB_HAVE_HAILO` only when both are found, and `HailoProbe` sits behind
-`#if MB_HAVE_HAILO`. Hosts without a Hailo-8 — such as the Qualcomm IQ-9075 EVK —
-build and run with the Hailo probe compiled out. No test suite.
+Requires `gtkmm-4.0`. Two backends are **optional**, each behind a CMake-set
+define and compiled out when absent (so the build works on any host):
+- HailoRT runtime (`libhailort` + `/usr/local/include/hailo`, via
+  `find_library`/`find_path`) → `MB_HAVE_HAILO`, gates `HailoProbe`. Hosts without
+  a Hailo-8 (e.g. the Qualcomm IQ-9075 EVK) build with it compiled out.
+- `libftdi1` (the **1.x** dev package — `pkg_check_modules(FTDI ... libftdi1)`,
+  header `<libftdi1/ftdi.h>`; **not** the legacy 0.x `libftdi-dev`) → `MB_HAVE_FTDI`,
+  gates `INA228Probe`. `apt install libftdi1-dev`.
+
+No test suite (the INA228 path was de-risked in `envic_ai_cpp/tests/mb_power_smoke.cpp`).
 
 No display forwarding? These boards are aarch64 and may lack `ffmpeg`/ImageMagick;
 `xwd` plus a ~10-line Pillow script that parses the XWD header is enough to turn a

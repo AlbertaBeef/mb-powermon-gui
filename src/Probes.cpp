@@ -10,6 +10,12 @@
 #include <hailo/hailort.hpp>
 #endif
 
+#if MB_HAVE_FTDI
+#include <libftdi1/ftdi.h>
+#include <chrono>
+#include <thread>
+#endif
+
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -372,8 +378,17 @@ private:
 // ---------------------------------------------------------------------------
 // Axelera Metis — per-core temps from the `triton_trace` collector log. We only
 // *peek* (never enable the collector or open a Context), so we never race for
-// device ownership. If the collector isn't already running the temps read as
-// missing — a deliberately passive tradeoff.
+// device ownership.
+//
+// Presence is keyed on the /dev/metis-0:* node, *not* on temps being available:
+// the card is registered (with its standard SYS/AI0–AI3 sensor set, NaN until
+// data flows) as soon as the node and a `triton_trace` binary exist. This keeps
+// a present-but-silent Metis visible in the UI instead of vanishing, and lets us
+// name *why* it is silent — the peek can come back empty for several distinct
+// reasons, each surfaced through note_:
+//   - firmware/runtime version mismatch (the tool refuses to talk to the card),
+//   - the collector simply isn't running (nothing is using the device),
+//   - no `triton_trace` on the host at all.
 // ---------------------------------------------------------------------------
 class AxeleraProbe : public DeviceProbe {
 public:
@@ -381,21 +396,28 @@ public:
 
     bool discover() {
         auto nodes = glob_paths("/dev/metis-0:*");
-        if (nodes.empty()) return false;
-        device_ = basename_of(nodes.front());  // e.g. "metis-0:c2:0"
+        if (nodes.empty()) return false;  // genuinely no Metis on this host
+        device_ = basename_of(nodes.front());  // e.g. "metis-0:c6:0"
 
         auto bins = glob_paths("/opt/axelera/runtime-*/bin/triton_trace");
-        cli_ = bins.empty() ? "triton_trace" : bins.front();
+        if (!bins.empty())
+            cli_ = bins.front();
+        else if (!run_capture("command -v triton_trace 2>/dev/null").empty())
+            cli_ = "triton_trace";  // on PATH
+        else
+            cli_.clear();  // no telemetry tool — device still registers
 
-        auto temps = read_temps();
-        if (temps.empty()) return false;
         bdf_ = find_pci_bdf_by_vendor(0x1f9d);  // Axelera
+
+        // Fixed sensor set for metis-0: SYS + four AI cores. Values arrive (or
+        // don't) via poll(); a silent card shows NaN, not absence.
         static const char* kLabels[] = {"SYS", "AI0", "AI1", "AI2", "AI3"};
-        for (size_t i = 0; i < temps.size() && i < 5; ++i) {
-            temp_metrics_.push_back(
-                {std::string("Axelera ") + kLabels[i], "°C"});
-            temp_values_.push_back(temps[i]);
+        for (auto* l : kLabels) {
+            temp_metrics_.push_back({std::string("Axelera ") + l, "°C"});
+            temp_values_.push_back(kNaN);
         }
+
+        poll();  // seed values + set note_ (version mismatch / idle / no tool)
         return true;
     }
 
@@ -407,8 +429,13 @@ public:
 
 private:
     std::vector<double> read_temps() {
+        if (cli_.empty()) {
+            note_ = "triton_trace not found — install the Axelera runtime";
+            return {};
+        }
+        // Capture stderr too (2>&1): the version-mismatch banner prints there.
         std::string out = run_capture("timeout 4 " + cli_ + " --device " +
-                                      device_ + " --slog --peek 2>/dev/null");
+                                      device_ + " --slog --peek 2>&1");
         static const std::regex re(R"(core_temps=\[([0-9,\s]+)\])");
         std::vector<double> last;
         for (std::sregex_iterator it(out.begin(), out.end(), re), end;
@@ -420,6 +447,23 @@ private:
                 try { cur.push_back(std::stod(tok)); } catch (...) {}
             }
             if (!cur.empty()) last = std::move(cur);
+        }
+
+        if (!last.empty()) {
+            note_.clear();  // nominal
+        } else {
+            // Name the reason for the empty read so the UI/log isn't cryptic.
+            std::smatch m;
+            static const std::regex vm(
+                R"RX(Actual="([^"]+)"\s+Expected="([^"]+)")RX");
+            if (std::regex_search(out, m, vm))
+                note_ = "device firmware " + m[1].str() + " vs tool " +
+                        m[2].str() +
+                        " — version mismatch, temps unavailable "
+                        "(align firmware/runtime)";
+            else
+                note_ = "collector idle — temps appear once a Metis "
+                        "app/collector is running";
         }
         return last;
     }
@@ -574,18 +618,288 @@ private:
     std::string path_;
 };
 
+#if MB_HAVE_FTDI
+// ---------------------------------------------------------------------------
+// INA228 external power meter over an FT232H USB->I2C bridge (libftdi1 MPSSE).
+// Reference-grade rail power that the on-card telemetry can't give (e.g. Axelera
+// M.2, Qualcomm IQ). One sensor per bridge is the norm; each bridge becomes its
+// own probe/legend row. Bridges carry no USB serial here, so they're selected by
+// libusb bus/address and named by enumeration order (`INA228#0`, `INA228#1`) —
+// a config file will later pin each to a specific accelerator. The MPSSE-I2C +
+// INA228 register/calibration path is lifted verbatim from the hardware-
+// validated envic_ai_cpp `mb_power_smoke`; defaults mirror mb-powermon.py's
+// INA228Probe (15 mΩ shunt, 5 A full-scale).
+// ---------------------------------------------------------------------------
+namespace ftdi {
+
+constexpr uint16_t kVid = 0x0403, kPid = 0x6014;  // FT232H
+// MPSSE clock-data opcodes not defined by ftdi.h.
+constexpr uint8_t OP_WR_BYTES = 0x11, OP_WR_BITS = 0x13,
+                  OP_RD_BYTES = 0x20, OP_RD_BITS = 0x22;
+constexpr uint8_t PIN_SCL = 0x01, PIN_SDA = 0x02;
+constexpr uint8_t DIR_DRIVE = PIN_SCL | PIN_SDA, DIR_READ = PIN_SCL;
+constexpr int HOLD = 6;  // repeat a GPIO state N times for I2C setup/hold time
+
+// MPSSE bit-banged I2C master on one specific FT232H (by libusb bus/address).
+class Ft232hI2c {
+public:
+    Ft232hI2c(int usb_bus, int usb_addr) : bus_(usb_bus), addr_(usb_addr) {}
+    ~Ft232hI2c() {
+        if (ftdi_) {
+            ftdi_set_bitmode(ftdi_, 0x00, BITMODE_RESET);
+            ftdi_usb_close(ftdi_);
+            ftdi_free(ftdi_);
+        }
+    }
+    std::string error;
+
+    bool open() {
+        ftdi_ = ftdi_new();
+        if (!ftdi_) { error = "ftdi_new failed"; return false; }
+        if (ftdi_usb_open_bus_addr(ftdi_, (uint8_t)bus_, (uint8_t)addr_) < 0) {
+            error = std::string("ftdi_usb_open: ") + ftdi_get_error_string(ftdi_);
+            return false;
+        }
+        ftdi_usb_reset(ftdi_);
+        ftdi_set_interface(ftdi_, INTERFACE_A);
+        ftdi_set_latency_timer(ftdi_, 1);
+        ftdi_tcioflush(ftdi_);
+        if (ftdi_set_bitmode(ftdi_, 0x00, BITMODE_RESET) < 0) { error = "bitmode reset"; return false; }
+        if (ftdi_set_bitmode(ftdi_, 0x00, BITMODE_MPSSE) < 0) { error = "bitmode MPSSE"; return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        buf_.clear();
+        q(DIS_DIV_5); q(DIS_ADAPTIVE); q(EN_3_PHASE); q(LOOPBACK_END);
+        q(TCK_DIVISOR); q(0xC7); q(0x00);  // ~100 kHz: 60MHz/(100kHz*3)-1 = 199
+        gpio(PIN_SCL | PIN_SDA, DIR_DRIVE);
+        if (!flush()) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return true;
+    }
+
+    void start() {
+        for (int i = 0; i < HOLD; ++i) gpio(PIN_SCL | PIN_SDA, DIR_DRIVE);
+        for (int i = 0; i < HOLD; ++i) gpio(PIN_SCL,           DIR_DRIVE);
+        for (int i = 0; i < HOLD; ++i) gpio(0x00,              DIR_DRIVE);
+    }
+    void stop() {
+        for (int i = 0; i < HOLD; ++i) gpio(0x00,              DIR_DRIVE);
+        for (int i = 0; i < HOLD; ++i) gpio(PIN_SCL,           DIR_DRIVE);
+        for (int i = 0; i < HOLD; ++i) gpio(PIN_SCL | PIN_SDA, DIR_DRIVE);
+        gpio(PIN_SCL | PIN_SDA, DIR_READ);
+    }
+    void rep_start() {
+        for (int i = 0; i < HOLD; ++i) gpio(PIN_SDA, DIR_DRIVE);
+        for (int i = 0; i < HOLD; ++i) gpio(PIN_SCL | PIN_SDA, DIR_DRIVE);
+        start();
+    }
+    bool write_byte(uint8_t b) {
+        gpio(0x00, DIR_DRIVE);
+        q(OP_WR_BYTES); q(0x00); q(0x00); q(b);
+        gpio(0x00, DIR_READ);
+        q(OP_RD_BITS); q(0x00);
+        q(SEND_IMMEDIATE);
+        uint8_t ack = 0xFF;
+        if (!flush_read(&ack, 1)) return false;
+        return (ack & 0x01) == 0;
+    }
+    uint8_t read_byte(bool ack) {
+        gpio(0x00, DIR_READ);
+        q(OP_RD_BYTES); q(0x00); q(0x00);
+        q(SEND_IMMEDIATE);
+        uint8_t data = 0;
+        flush_read(&data, 1);
+        gpio(0x00, DIR_DRIVE);
+        q(OP_WR_BITS); q(0x00); q(ack ? 0x00 : 0x80);
+        flush();
+        return data;
+    }
+    bool reg_read(uint8_t a, uint8_t reg, uint8_t* out, int n) {
+        start();
+        if (!write_byte((a << 1) | 0)) { stop(); error = "no ACK (addr+W)"; return false; }
+        if (!write_byte(reg))          { stop(); error = "no ACK (reg)";    return false; }
+        rep_start();
+        if (!write_byte((a << 1) | 1)) { stop(); error = "no ACK (addr+R)"; return false; }
+        for (int i = 0; i < n; ++i) out[i] = read_byte(i < n - 1);
+        stop();
+        return true;
+    }
+    bool ping(uint8_t a) {
+        start();
+        bool ack = write_byte((a << 1) | 0);
+        stop();
+        return ack;
+    }
+
+private:
+    int bus_, addr_;
+    ftdi_context* ftdi_ = nullptr;
+    std::vector<uint8_t> buf_;
+    void q(uint8_t b) { buf_.push_back(b); }
+    void gpio(uint8_t val, uint8_t dir) { q(SET_BITS_LOW); q(val); q(dir); }
+    bool flush() {
+        if (buf_.empty()) return true;
+        int rc = ftdi_write_data(ftdi_, buf_.data(), (int)buf_.size());
+        bool ok = rc == (int)buf_.size();
+        if (!ok) error = std::string("ftdi_write_data: ") + ftdi_get_error_string(ftdi_);
+        buf_.clear();
+        return ok;
+    }
+    bool flush_read(uint8_t* out, int n) {
+        if (!flush()) return false;
+        int got = 0;
+        for (int tries = 0; tries < 1000 && got < n; ++tries) {
+            int rc = ftdi_read_data(ftdi_, out + got, n - got);
+            if (rc < 0) { error = "ftdi_read_data failed"; return false; }
+            got += rc;
+            if (rc == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        if (got < n) { error = "short read from FT232H"; return false; }
+        return true;
+    }
+};
+
+// TI INA228 register driver (big-endian). POWER is full 24-bit (no >>4).
+struct Ina228 {
+    Ft232hI2c* bus = nullptr;
+    uint8_t addr = 0x40;
+    double current_lsb = 0.0;
+    enum Reg : uint8_t {
+        CONFIG = 0x00, ADC_CONFIG = 0x01, SHUNT_CAL = 0x02,
+        VBUS = 0x05, CURRENT = 0x07, POWER = 0x08, DEVICE_ID = 0x3F,
+    };
+    bool write_reg16(uint8_t reg, uint16_t v) {
+        bus->start();
+        bool ok = bus->write_byte((addr << 1) | 0) && bus->write_byte(reg) &&
+                  bus->write_byte((uint8_t)(v >> 8)) && bus->write_byte((uint8_t)(v & 0xFF));
+        bus->stop();
+        return ok;
+    }
+    uint16_t read16(uint8_t reg, bool* ok) {
+        uint8_t b[2] = {0, 0};
+        *ok = bus->reg_read(addr, reg, b, 2);
+        return (uint16_t)((b[0] << 8) | b[1]);
+    }
+    uint32_t read24(uint8_t reg, bool* ok) {
+        uint8_t b[3] = {0, 0, 0};
+        *ok = bus->reg_read(addr, reg, b, 3);
+        return ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
+    }
+    uint32_t read24_raw20(uint8_t reg, bool* ok) { return read24(reg, ok) >> 4; }
+    bool configure(double shunt_res, double max_current) {
+        current_lsb = max_current / 524288.0;  // 2^19
+        uint16_t cal = (uint16_t)(13107200000.0 * current_lsb * shunt_res + 0.5);
+        uint16_t adc = (0xF << 12) | (5 << 9) | (5 << 6) | (5 << 3) | 3;  // 0xFB6B
+        return write_reg16(CONFIG, 0x0000) && write_reg16(ADC_CONFIG, adc) &&
+               write_reg16(SHUNT_CAL, cal);
+    }
+    double power(bool* ok) { return read24(POWER, ok) * 3.2 * current_lsb; }  // W
+};
+
+// Enumerate FT232H bridges via sysfs → their libusb bus/address (busnum/devnum).
+struct Loc { int bus, addr; };
+inline std::vector<Loc> enumerate_bridges() {
+    std::vector<Loc> out;
+    for (const auto& d : glob_paths("/sys/bus/usb/devices/*")) {
+        if (std::strtoul(trim_sysfs(read_file(d + "/idVendor")).c_str(), nullptr, 16) != kVid) continue;
+        if (std::strtoul(trim_sysfs(read_file(d + "/idProduct")).c_str(), nullptr, 16) != kPid) continue;
+        int bus = std::atoi(trim_sysfs(read_file(d + "/busnum")).c_str());
+        int addr = std::atoi(trim_sysfs(read_file(d + "/devnum")).c_str());
+        if (bus && addr) out.push_back({bus, addr});
+    }
+    return out;
+}
+}  // namespace ftdi
+
+// One FT232H bridge and the INA228(s) on it, as a DeviceProbe. Passive w.r.t.
+// the accelerator — it measures the rail, never touches the NPU.
+class INA228Probe : public DeviceProbe {
+public:
+    INA228Probe(int usb_bus, int usb_addr, int index)
+        : usb_bus_(usb_bus), usb_addr_(usb_addr) {
+        name_ = "INA228#" + std::to_string(index);
+    }
+    const char* name() const override { return name_.c_str(); }
+
+    bool discover() {
+        bus_ = std::make_unique<ftdi::Ft232hI2c>(usb_bus_, usb_addr_);
+        if (!bus_->open()) {
+            note_ = "FT232H open failed: " + bus_->error;
+            return false;
+        }
+        // Canonical Adafruit-strap addresses; usually just one responds.
+        for (uint8_t a : {0x40, 0x41, 0x44, 0x45}) {
+            if (!bus_->ping(a)) continue;
+            ftdi::Ina228 s;
+            s.bus = bus_.get();
+            s.addr = a;
+            if (!s.configure(0.015, 5.0)) continue;
+            sensors_.push_back(s);
+            power_metrics_.push_back({name_ + " POW", "W"});
+            power_values_.push_back(kNaN);
+        }
+        if (sensors_.empty()) {
+            note_ = "FT232H present but no INA228 responded";
+            return false;
+        }
+        // If a bridge carries more than one sensor, disambiguate by I2C address.
+        if (sensors_.size() > 1)
+            for (size_t i = 0; i < sensors_.size(); ++i) {
+                char l[24];
+                std::snprintf(l, sizeof l, "%s 0x%02X", name_.c_str(), sensors_[i].addr);
+                power_metrics_[i].label = l;
+            }
+        char loc[24];
+        std::snprintf(loc, sizeof loc, "usb %d-%d", usb_bus_, usb_addr_);
+        bdf_ = loc;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle
+        return true;
+    }
+
+    void poll() override {
+        for (size_t i = 0; i < sensors_.size(); ++i) {
+            bool ok = false;
+            double p = sensors_[i].power(&ok);
+            power_values_[i] = ok ? p : kNaN;
+        }
+    }
+
+private:
+    int usb_bus_, usb_addr_;
+    std::string name_;
+    std::unique_ptr<ftdi::Ft232hI2c> bus_;
+    std::vector<ftdi::Ina228> sensors_;
+};
+#endif  // MB_HAVE_FTDI
+
 }  // namespace
 
 void Probes::discover(std::vector<std::string>* notes) {
     auto try_add = [&](std::unique_ptr<DeviceProbe> p, bool ok) {
         if (ok) {
-            if (notes)
-                notes->push_back(std::string(p->name()) + ": " +
-                                 std::to_string(p->temp_metrics().size()) +
-                                 " temp sensor(s)");
+            if (notes) {
+                // A present device with a note (e.g. version mismatch) is silent
+                // for a nameable reason — report that instead of a sensor count.
+                std::string msg = std::string(p->name()) + ": ";
+                if (!p->note().empty()) {
+                    msg += p->note();
+                } else {
+                    const size_t nt = p->temp_metrics().size();
+                    const size_t np = p->power_metrics().size();
+                    std::vector<std::string> parts;
+                    if (nt) parts.push_back(std::to_string(nt) + " temp");
+                    if (np) parts.push_back(std::to_string(np) + " power");
+                    if (parts.empty()) parts.push_back("0");
+                    for (size_t i = 0; i < parts.size(); ++i)
+                        msg += (i ? " + " : "") + parts[i];
+                    msg += " sensor(s)";
+                }
+                notes->push_back(std::move(msg));
+            }
             devices_.push_back(std::move(p));
         } else if (notes) {
-            notes->push_back(std::string(p->name()) + ": not present / no data");
+            notes->push_back(std::string(p->name()) + ": " +
+                             (p->note().empty() ? "not present / no data"
+                                                : p->note()));
         }
     };
 
@@ -621,6 +935,19 @@ void Probes::discover(std::vector<std::string>* notes) {
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }
+#if MB_HAVE_FTDI
+    // One probe per FT232H bridge (each carries an INA228). No serials here, so
+    // they're numbered by enumeration order; a future config file maps each to
+    // an accelerator.
+    {
+        int idx = 0;
+        for (const auto& br : ftdi::enumerate_bridges()) {
+            auto p = std::make_unique<INA228Probe>(br.bus, br.addr, idx++);
+            bool ok = p->discover();
+            try_add(std::move(p), ok);
+        }
+    }
+#endif
 
     flatten();
 }

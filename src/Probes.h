@@ -30,6 +30,10 @@ public:
     virtual ~DeviceProbe() = default;
     virtual const char* name() const = 0;
     const std::string& bdf() const { return bdf_; }
+    // Optional human-readable status when a device is present but not returning
+    // data (e.g. firmware/runtime version mismatch, idle collector). Empty when
+    // the device is nominal or genuinely absent.
+    const std::string& note() const { return note_; }
 
     // Refresh readings. Fills temp_values()/power_values(), aligned to the
     // corresponding *_metrics() lists; a missing reading is NaN.
@@ -46,6 +50,7 @@ protected:
     std::vector<MetricInfo> power_metrics_;
     std::vector<double> power_values_;
     std::string bdf_;
+    std::string note_;
 };
 
 // Discovers every supported device and presents their metrics as two flat,

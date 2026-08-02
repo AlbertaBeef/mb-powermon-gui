@@ -37,9 +37,13 @@ is added alongside the on-card source, the label reports the highest of them.
 | **Axelera Metis** | `SYS` / `AI0`–`AI3` via `triton_trace --peek` | — (not exposed on M.2) | ✅ |
 | **Qualcomm IQ** (IQ-9075 / QCS9075) | `N0-0`–`N1-2` via the `nsp-*-thermal` sysfs zones | — (**no** power measurement exists on the board) | ✅ |
 | **IQ9075 Board** (ambient) | `AMB` via a TI TMP411 on i2c-19 0x4c (hwmon `temp1_input`) | — | ✅ |
+| **INA228** (external) | — | `POW` (W) — an INA228 on an FT232H USB→I²C bridge (libftdi1 MPSSE), one probe per bridge | ✅ (measures the rail, never touches the NPU) |
 
 Devices are auto-discovered at startup; only what's present appears. Whatever a
-card doesn't expose simply doesn't get a trace.
+card doesn't expose simply doesn't get a trace. One exception: a Metis whose
+`/dev/metis-0:*` node exists but isn't currently reporting temps (see the Axelera
+note under [Configuration](#configuration)) still gets a legend row — values `—`
+until data flows — with the reason logged, rather than silently vanishing.
 
 ### Enabling the IQ-9075 board ambient sensor
 
@@ -136,17 +140,22 @@ Python helper launched from the MemryX venv, which connects once to the
 multi-process `mxa-manager` daemon and streams the reading — no per-poll cost and
 no interference with inference.
 
+The external **INA228** meter is fully passive too: it reads a sensor sitting on
+the power rail through its own FT232H USB→I²C bridge, so it never touches the
+accelerator at all. It's the only reference-grade watt figure for cards that
+expose no on-die power (Axelera M.2, Qualcomm IQ).
+
 ## Build & run
 
-Requires `gtkmm-4.0`, CMake ≥ 3.16, and a C++17 compiler. The HailoRT runtime
-(`libhailort` + `/usr/local/include/hailo`) is **optional** — without it CMake
-prints `libhailort not found — building without Hailo-8 support` and compiles the
-Hailo probe out, which is how the build works on hosts with no Hailo-8 (e.g. the
-Qualcomm IQ-9075 EVK).
+Requires `gtkmm-4.0`, CMake ≥ 3.16, and a C++17 compiler. Two backends are
+**optional**, each compiled out (with a CMake status line) when absent:
+- **HailoRT runtime** (`libhailort` + `/usr/local/include/hailo`) — enables Hailo-8;
+  its absence is how the build works on hosts with no Hailo-8 (e.g. the IQ-9075 EVK).
+- **`libftdi1`** (the 1.x dev package) — enables the INA228/FT232H external power probe.
 
 ```bash
-sudo apt install libgtkmm-4.0-dev cmake g++     # + the HailoRT runtime package
-                                                # (optional; enables Hailo-8)
+sudo apt install libgtkmm-4.0-dev libftdi1-dev cmake g++   # libftdi1-dev optional
+                                                # (INA228); + HailoRT pkg for Hailo-8
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
@@ -164,6 +173,30 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
   shows no power row.
 - The `[HailoRT] … overcurrent protection` lines printed at startup are the
   expected OCP-disable notice for the Hailo power session, not errors.
+- **Axelera temperatures** need two things the probe deliberately won't force (it
+  stays passive): the card's **application firmware loaded**, and the collector
+  **log level at `inf`**. A running Voyager inference app clears both automatically —
+  and both reset on reboot. Idle after a fresh boot, the Metis sits in *bootloader*
+  firmware, so the legend still shows an Axelera row (values `—`) and the startup log
+  says why (`… version mismatch, temps unavailable …`). To bring temps back without
+  running a model: load firmware into RAM with `axcmd --device <dev> --fwload
+  /opt/axelera/device-*/omega/bin/start_axelera_runtime.elf` (not `--flashload`), then
+  `triton_trace --device <dev> --slog-level inf`. The row fills in on its own within a
+  second — no restart needed.
+- **INA228 external power** is auto-discovered: every FT232H bridge (`0403:6014`) is
+  enumerated and its INA228 (canonical addresses `{0x40,0x41,0x44,0x45}`) read over
+  libftdi1 MPSSE-I²C. Two prerequisites:
+  - **`libftdi1-dev`** at build time (`pkg-config libftdi1`, the **1.x** package —
+    header `<libftdi1/ftdi.h>`, not legacy 0.x). Absent → the probe is compiled out.
+  - **USB permissions**: the FT232H raw node must be openable by your user. Install a
+    udev rule (`SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", MODE="0666"`) — udev applies
+    it on the next `add` event, so a fresh boot or a replug picks it up. libftdi
+    auto-detaches the `ftdi_sio` serial driver, so `/dev/ttyUSB*` being present is fine.
+
+  Bridges here carry no USB serial, so probes are named by enumeration order
+  (`INA228#0`, `INA228#1`) with the USB bus/address as the BDF (`usb 1-3`). That order
+  isn't a stable accelerator mapping across replug/reboot — a config file mapping each
+  bridge to an accelerator is planned.
 
 ## Design
 
@@ -182,7 +215,7 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
 
 | File | Role |
 | ---- | ---- |
-| `src/Probes.{h,cpp}` | device discovery + per-tick telemetry (HailoRT / `dxrt-cli` / sysfs / `triton_trace` / MemryX helper / `nsp-*-thermal` zones). No GTK dependency. |
+| `src/Probes.{h,cpp}` | device discovery + per-tick telemetry (HailoRT / `dxrt-cli` / sysfs / `triton_trace` / MemryX helper / `nsp-*-thermal` zones / INA228 over FT232H via libftdi1). No GTK dependency. |
 | `src/GraphArea.{h,cpp}` | reusable Cairo scrolling multi-series graph (fixed or auto axis, NaN gaps, height-responsive) |
 | `src/MainWindow.{h,cpp}` | the two sections, device-grouped legend, teal header bar, 1 Hz refresh |
 | `src/util.h` | brand palette (accent + neutral), size/rate formatting, nice-axis rounding |

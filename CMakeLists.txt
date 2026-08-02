@@ -26,6 +26,16 @@ else()
   message(STATUS "libhailort not found — building without Hailo-8 support")
 endif()
 
+# libftdi1 (optional) — external reference-grade power from INA228 sensors on an
+# FT232H USB->I2C bridge. Absent → the INA228 probe is compiled out and the GUI
+# simply shows no external power rows.
+pkg_check_modules(FTDI QUIET libftdi1)
+if(FTDI_FOUND)
+  message(STATUS "libftdi1 ${FTDI_VERSION} found — INA228/FT232H power probe enabled")
+else()
+  message(STATUS "libftdi1 not found — building without INA228 external power")
+endif()
+
 # Compile assets/ into the binary as a GResource. The About dialog loads its logo
 # with Gdk::Texture::create_from_resource(), which finds nothing unless this runs.
 find_program(GLIB_COMPILE_RESOURCES glib-compile-resources REQUIRED)
@@ -58,6 +68,12 @@ if(MB_HAVE_HAILO)
   target_include_directories(mb-powermon PRIVATE ${HAILORT_INC})
   target_link_libraries(mb-powermon PRIVATE ${HAILORT_LIB})
   target_compile_definitions(mb-powermon PRIVATE MB_HAVE_HAILO=1)
+endif()
+if(FTDI_FOUND)
+  target_include_directories(mb-powermon PRIVATE ${FTDI_INCLUDE_DIRS})
+  target_link_libraries(mb-powermon PRIVATE ${FTDI_LIBRARIES})
+  target_link_directories(mb-powermon PRIVATE ${FTDI_LIBRARY_DIRS})
+  target_compile_definitions(mb-powermon PRIVATE MB_HAVE_FTDI=1)
 endif()
 target_compile_options(mb-powermon PRIVATE
   -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
