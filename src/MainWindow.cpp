@@ -67,7 +67,10 @@ MainWindow::MainWindow() {
     auto css = Gtk::CssProvider::create();
     css->load_from_data(
         "headerbar { background: #64A19D; box-shadow: none; }"
-        "headerbar label.title { color: #FFFFFF; font-weight: bold; }");
+        "headerbar label.title { color: #FFFFFF; font-weight: bold; }"
+        // About dialog: its name label is a selectable label that auto-selects
+        // on open; hide that selection highlight so the name reads plainly.
+        ".mb-about selection { background-color: transparent; color: inherit; }");
     Gtk::StyleContext::add_provider_for_display(
         Gdk::Display::get_default(), css,
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -308,15 +311,15 @@ void MainWindow::on_about() {
     // Configure once; thereafter just re-show the same (hidden) dialog.
     if (!about_ready_) {
         about_ready_ = true;
+        about_dialog_.add_css_class("mb-about");
         about_dialog_.set_transient_for(*this);
         about_dialog_.set_modal(true);
         about_dialog_.set_hide_on_close(true);
         about_dialog_.set_program_name(
             "NPU Power and Temperature Monitoring GUI");
-        about_dialog_.set_version("1.0");
+        about_dialog_.set_version("0.01");
         about_dialog_.set_comments(
-            "Monitors the power and temperature of edge-AI NPUs — Hailo, "
-            "DeepX, MemryX, and Axelera — as live scrolling graphs.");
+            "Monitors the power and temperature of edge-AI NPUs.");
         about_dialog_.set_copyright("© 2026 Mario Bergeron");
         about_dialog_.set_license_type(Gtk::License::APACHE_2_0);
         about_dialog_.set_website("https://mariobergeron.com");
