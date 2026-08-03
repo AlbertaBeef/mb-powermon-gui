@@ -96,6 +96,15 @@ MainWindow::MainWindow() {
         };
         index_devs(probes_.temp_metrics());
         index_devs(probes_.power_metrics());
+
+        // Fixed colour per accelerator, before the alias pass — a mapped
+        // INA228 then inherits its card's colour rather than a palette slot.
+        // Shared with mb-benchmark-gui via util.h so a card looks the same in
+        // both apps.
+        for (int i = 0; i < nd; ++i) {
+            Gdk::RGBA c;
+            if (util::device_accent(dname[i], c)) device_palette_[i] = c;
+        }
         for (int i = 0; i < nd; ++i) {
             if (dalias[i].empty()) continue;
             for (int j = 0; j < nd; ++j)

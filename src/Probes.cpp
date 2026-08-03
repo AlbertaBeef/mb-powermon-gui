@@ -953,12 +953,12 @@ void Probes::discover(std::vector<std::string>* notes) {
     }
 #endif
     {
-        auto p = std::make_unique<DeepXProbe>();
+        auto p = std::make_unique<MemryXProbe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }
     {
-        auto p = std::make_unique<MemryXProbe>();
+        auto p = std::make_unique<DeepXProbe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }

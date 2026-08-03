@@ -3,7 +3,9 @@
 
 #include <gdkmm/rgba.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -109,6 +111,38 @@ inline Gdk::RGBA mist()       { return rgb8(0xEA, 0xF1, 0xF0); }
 inline Gdk::RGBA slate_gray() { return rgb8(0x6B, 0x76, 0x76); }
 inline Gdk::RGBA ink()        { return rgb8(0x1F, 0x2A, 0x2A); }
 }  // namespace neutral
+
+// Fixed accent per accelerator. A card keeps the same colour across every graph
+// *and* across the sibling apps (mb-benchmark-gui / mb-powermon-gui), so a trace
+// is recognisable without reading the legend. Anything not listed here — INA228
+// bridges, board sensors, the Qualcomm NSP — falls back to the cycling palette
+// below. Returns false when the name isn't a known accelerator.
+inline bool device_accent(const std::string& device_name, Gdk::RGBA& out) {
+    if (device_name == "Axelera") { out = accent::amber();      return true; }
+    if (device_name == "Hailo")   { out = accent::coral();      return true; }
+    if (device_name == "DeepX")   { out = accent::slate_blue(); return true; }
+    if (device_name == "MemryX")  { out = accent::sage();       return true; }
+
+    // The Qualcomm NSP names itself after the board — "IQ9075", "QCS9075",
+    // "QRB…", "SA…" — and only falls back to "Qualcomm" when the device tree
+    // says nothing. Match both forms. The separate board-ambient probe calls
+    // itself "<board> Board"; it measures the chassis, not the NPU, so the
+    // space in its name deliberately excludes it here.
+    if (device_name == "Qualcomm") { out = accent::plum(); return true; }
+    if (device_name.find(' ') == std::string::npos) {
+        for (const char* pfx : {"IQ", "QCS", "QRB", "SA"}) {
+            const std::size_t n = std::strlen(pfx);
+            if (device_name.size() < n + 4) continue;
+            if (device_name.compare(0, n, pfx) != 0) continue;
+            bool digits = true;
+            for (std::size_t i = n; i < n + 4; ++i)
+                if (!std::isdigit(static_cast<unsigned char>(device_name[i])))
+                    digits = false;
+            if (digits) { out = accent::plum(); return true; }
+        }
+    }
+    return false;
+}
 
 // n colors for the per-device traces/swatches, drawn only from the brand
 // accent colors (cycled if there are more devices than accents).
