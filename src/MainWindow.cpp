@@ -145,7 +145,12 @@ Gtk::Expander& MainWindow::make_section(const char* title, Gtk::Widget& content)
     exp->set_label_widget(*lbl);
     exp->set_expanded(true);
     exp->set_margin_top(4);
-    exp->set_vexpand(true);  // share vertical space with the other section
+    // Only claim vertical space while expanded; a collapsed expander with
+    // vexpand=true would keep its share of the window as an empty gap. Bind
+    // vexpand to the expanded state so collapsing gives the space back.
+    exp->set_vexpand(exp->get_expanded());
+    exp->property_expanded().signal_changed().connect(
+        [exp]() { exp->set_vexpand(exp->get_expanded()); });
     auto* pad = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL);
     pad->set_margin_top(6);
     pad->set_margin_start(4);
