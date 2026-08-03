@@ -80,6 +80,31 @@ MainWindow::MainWindow() {
     for (const auto& n : notes) g_message("probe: %s", n.c_str());
 
     device_palette_ = util::make_palette(std::max(1, probes_.device_count()));
+
+    // Let a device with a color_alias (a mapped INA228, e.g. "INA228 - Hailo")
+    // reuse the swatch of the device it names ("Hailo"), so the external shunt
+    // series matches its accelerator across both graphs.
+    {
+        const int nd = probes_.device_count();
+        std::vector<std::string> dname(nd), dalias(nd);
+        auto index_devs = [&](const std::vector<MetricInfo>& ms) {
+            for (const auto& m : ms)
+                if (m.device >= 0 && m.device < nd) {
+                    dname[m.device] = m.device_name;
+                    if (!m.color_alias.empty()) dalias[m.device] = m.color_alias;
+                }
+        };
+        index_devs(probes_.temp_metrics());
+        index_devs(probes_.power_metrics());
+        for (int i = 0; i < nd; ++i) {
+            if (dalias[i].empty()) continue;
+            for (int j = 0; j < nd; ++j)
+                if (j != i && dname[j] == dalias[i]) {
+                    device_palette_[i] = device_palette_[j];
+                    break;
+                }
+        }
+    }
     last_time_us_ = g_get_monotonic_time();
 
     // Fill layout (not a natural-height scroller): the two sections share the

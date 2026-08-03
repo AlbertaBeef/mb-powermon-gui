@@ -22,6 +22,9 @@ struct MetricInfo {
     // PCIe BDF, e.g. "0000:01:00.0". For an SoC-integrated NPU there is no BDF,
     // so this carries an equivalent locator instead (e.g. the SoC id "QCS9075").
     std::string bdf;
+    // Name of another device whose color this one should share (empty = own
+    // color). Set for a mapped INA228 so it reuses its accelerator's swatch.
+    std::string color_alias;
 };
 
 // A single device's telemetry source.
@@ -34,6 +37,8 @@ public:
     // data (e.g. firmware/runtime version mismatch, idle collector). Empty when
     // the device is nominal or genuinely absent.
     const std::string& note() const { return note_; }
+    // Name of another device whose color to share (empty = own color).
+    const std::string& color_alias() const { return color_alias_; }
 
     // Refresh readings. Fills temp_values()/power_values(), aligned to the
     // corresponding *_metrics() lists; a missing reading is NaN.
@@ -51,6 +56,7 @@ protected:
     std::vector<double> power_values_;
     std::string bdf_;
     std::string note_;
+    std::string color_alias_;
 };
 
 // Discovers every supported device and presents their metrics as two flat,
@@ -72,8 +78,14 @@ public:
 
 private:
     void flatten();
+    // Device order for the power section: a mapped INA228 grouped just before the
+    // accelerator it names (INA228 first). See Probes.cpp.
+    std::vector<size_t> power_device_order() const;
+    // Accelerator index a PCIe-mapped INA228 should fold its reading onto, or -1.
+    int pcie_merge_target(size_t k) const;
 
     std::vector<std::unique_ptr<DeviceProbe>> devices_;
     std::vector<MetricInfo> temp_metrics_, power_metrics_;
     std::vector<double> temp_values_, power_values_;
+    std::vector<size_t> power_dev_order_;  // devices_ indices, power emission order
 };

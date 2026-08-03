@@ -23,9 +23,9 @@ the PCIe BDF), e.g. `0000:c2:00.0 Axelera  SYS · AI0 · AI1 · AI2 · AI3`.
 Each device row also carries a **per-device summary** between the name and the
 individual readings: temperature shows the device's **average** across its
 sensors (`avg 60°C`), power shows the **max** across its readings (`max 0.93 W`).
-With one power source per card today the max equals that lone reading, but it's
-computed over all of a device's power metrics — so when an external INA228 meter
-is added alongside the on-card source, the label reports the highest of them.
+The max spans *all* of a device's power metrics, so where an external INA228 meter
+is mapped onto a card (see [Configuration](#configuration)) the row shows both its
+on-die `POW` and the shunt `INA228` reading, and the summary reports the larger.
 
 ## Supported devices & how telemetry is read
 
@@ -193,10 +193,31 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
     it on the next `add` event, so a fresh boot or a replug picks it up. libftdi
     auto-detaches the `ftdi_sio` serial driver, so `/dev/ttyUSB*` being present is fine.
 
-  Bridges here carry no USB serial, so probes are named by enumeration order
-  (`INA228#0`, `INA228#1`) with the USB bus/address as the BDF (`usb 1-3`). That order
-  isn't a stable accelerator mapping across replug/reboot — a config file mapping each
-  bridge to an accelerator is planned.
+  Bridges here carry no USB serial, so each is identified by its **USB port-path**
+  (sysfs kernel name, e.g. `1-1`) — the physical port, which is stable across
+  replug/reboot (unlike the bus-devnum `usb 1-3` string). A **config file** maps each
+  port-path to a legend label:
+
+  ```ini
+  # $XDG_CONFIG_HOME/mb-powermon-gui/ina228.conf  (or ~/.config/…; override with
+  # $MB_INA228_CONFIG). Lines are "<port-path> = <label>", '#' comments.
+  1-1 = Hailo       # the INA228 on physical port 1-1 measures the Hailo rail
+  1-2 = Axelera
+  ```
+
+  **How a mapped INA228 is shown depends on its accelerator:**
+  - **Mapped to a present PCIe (M.2) device** (Hailo, DeepX, MemryX, Axelera): the
+    INA228 reading **folds onto that device's own row** as an extra `INA228` power
+    entry (placed before the vendor's own reading), sharing the row, color, and BDF.
+    The row's **`max`** then spans both readings — the original purpose of the
+    per-device max. So `Hailo` shows `INA228` *and* `POW` (a firmware-vs-shunt
+    cross-check), and `Axelera` — which has no on-die power — gets its first power
+    number as a lone `INA228` entry.
+  - **Unmapped, or mapped to an absent / non-PCIe device** (e.g. the Qualcomm SoC):
+    the INA228 gets its **own row**, labelled `INA228 - <label>` (or `INA228#<n>` if
+    unmapped), reusing its accelerator's color when mapped.
+
+  The Temperature section is unaffected (INA228 has no temperature).
 
 ## Design
 

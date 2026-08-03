@@ -38,8 +38,16 @@ Clean split between data and UI — keep it that way.
   every supported device and presents their metrics as two flat, stable lists
   (`temp_metrics()` / `power_metrics()`), each with an aligned value vector
   refreshed by `poll()`. A missing reading is `NaN`. Each `MetricInfo` carries
-  `label`, `unit`, the owning `device` index, `device_name`, and PCIe `bdf` —
-  stamped in `Probes::flatten()`, not by the individual probes.
+  `label`, `unit`, the owning `device` index, `device_name`, `bdf`, and
+  `color_alias` — stamped in `Probes::flatten()`, not by the individual probes.
+  Temp metrics follow discovery order; **power metrics use `power_device_order()`**,
+  which groups a mapped INA228 just above the accelerator it names (INA228 first),
+  so `power_values_`/`power_metrics_` share that order (`poll()` fills values via
+  `power_dev_order_`, not raw device order). A mapped INA228 whose accelerator is
+  present **and PCIe** (`pcie_merge_target()`) is *folded onto that device's row*:
+  `flatten()` rewrites its metric's `device`/`device_name`/`bdf` to the accelerator's
+  and its label to `<accel> INA228`, so it shares the row/color and the row's `max`
+  spans on-die + shunt. Non-PCIe / absent-target / unmapped INA228 keep their own row.
   - **HailoProbe** — HailoRT C++ API (`libhailort`). `get_chip_temperature()` →
     TS0/TS1; power via `set/start/get_power_measurement`. `start_power()` calls
     `stop_power_measurement()` **first** to reclaim the DVM (the firmware runs its
@@ -90,7 +98,10 @@ Clean split between data and UI — keep it that way.
   **aggregate** label (`AggEntry` = label + metric `[start,count)` range) after
   the device name; the tick fills it in — **mean** for temperature, **max** for
   power — skipping `NaN`. Power aggregates over *all* of a device's power metrics,
-  so a future INA228 reading joins the max automatically.
+  which is exactly what makes a PCIe-mapped INA228 folded onto an accelerator's row
+  raise that row's `max` — realized: a Hailo row shows both `POW` (firmware) and
+  `INA228` (shunt), its `max` the larger; Axelera's lone `INA228` gives it its first
+  power number.
 - **`util.h`** — the brand palette (accent + neutral), size/rate formatting,
   `nice_ceil`, and `make_palette` (returns **accent colors**, cycled).
 
@@ -105,7 +116,10 @@ the graphs/legend automatically — the UI is metric-agnostic.
   passive. Don't make the other backends intrusive without a reason.
 - **Per-device color.** Every metric of a device uses one color from the brand
   **accent** palette (`m.device` indexes `device_palette_`), consistent across
-  both graphs. `MainWindow::colors_for()` maps metrics → colors.
+  both graphs. `MainWindow::colors_for()` maps metrics → colors. A device may set
+  `color_alias_` to another device's name to **share its swatch** (a mapped INA228
+  reuses its accelerator's color); the ctor remaps `device_palette_` after
+  `make_palette()` by matching `color_alias` → device name.
 - **Colors come only from the brand palette** (`util::accent` / `util::neutral`).
   Accent = series (Amber, Slate Blue, Sage, Plum; Coral reserved for alerts, Sand
   for fills). Neutral = graph chrome (Slate Gray grid/text, `#FAFAFA` plot bg —
@@ -207,11 +221,19 @@ the graphs/legend automatically — the UI is metric-agnostic.
   carries its USB locator (`usb <bus>-<addr>`).
 - **INA228 identity** — the FT232H bridges here have **no USB serial**, and every
   INA228 sits at the same default address `0x40` on its *own* bus, so neither the
-  USB serial nor the I²C address disambiguates them. Probes are opened by libusb
-  bus/address and named by **enumeration order** (`INA228#0`, `INA228#1`), which is
-  **not stable** across replug/reboot — so do **not** treat `#0` as a fixed
-  accelerator. A config file mapping each bridge to an accelerator is the planned
-  fix; until then the order is best-effort. Runtime prereqs: a udev rule
+  USB serial nor the I²C address disambiguates them. The stable key is the **USB
+  port-path** (sysfs kernel name, e.g. `1-1`) — the physical port, unchanged by
+  replug/reboot, *not* bus-devnum (`ftdi::Loc::port`; also the `bdf_`, shown as
+  `usb 1-1`). `ina228.conf` (`$MB_INA228_CONFIG` → `$XDG_CONFIG_HOME/mb-powermon-gui/`
+  → `~/.config/…`) maps `<port-path> = <label>`; a mapped bridge's probe is *named*
+  `INA228 - <label>` (so its legend row reads e.g. `INA228 - Hailo`/`INA228 - Axelera`
+  — the `INA228 - ` prefix is prepended in code, config values stay bare accelerator
+  names) — this standalone name/color path applies only when the INA228 is **not**
+  folded onto a PCIe accelerator (see `pcie_merge_target()` in the Probes section: a
+  PCIe-mapped INA228 instead becomes an `INA228` entry on the accelerator's own row).
+  An unmapped one is `INA228#<n>` by enumeration order. `bus`/`addr` (devnum) are
+  still used to *open* the device (`ftdi_usb_open_bus_addr`) — only the identity/label
+  keys on the port. Runtime prereqs: a udev rule
   (`ATTRS{idVendor}=="0403", MODE="0666"`) so the raw USB node is user-openable —
   it applies on the next `add` event (fresh boot / replug), not on already-
   enumerated devices — and libftdi auto-detaches `ftdi_sio` at open (so

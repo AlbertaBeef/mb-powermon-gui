@@ -795,8 +795,10 @@ struct Ina228 {
     double power(bool* ok) { return read24(POWER, ok) * 3.2 * current_lsb; }  // W
 };
 
-// Enumerate FT232H bridges via sysfs → their libusb bus/address (busnum/devnum).
-struct Loc { int bus, addr; };
+// Enumerate FT232H bridges via sysfs. `bus`/`addr` (busnum/devnum) open the
+// device with libftdi; `port` is the sysfs kernel name (e.g. "1-1"), the stable
+// physical-port path used as the config key — unlike devnum, it survives replug.
+struct Loc { int bus, addr; std::string port; };
 inline std::vector<Loc> enumerate_bridges() {
     std::vector<Loc> out;
     for (const auto& d : glob_paths("/sys/bus/usb/devices/*")) {
@@ -804,9 +806,45 @@ inline std::vector<Loc> enumerate_bridges() {
         if (std::strtoul(trim_sysfs(read_file(d + "/idProduct")).c_str(), nullptr, 16) != kPid) continue;
         int bus = std::atoi(trim_sysfs(read_file(d + "/busnum")).c_str());
         int addr = std::atoi(trim_sysfs(read_file(d + "/devnum")).c_str());
-        if (bus && addr) out.push_back({bus, addr});
+        if (bus && addr) out.push_back({bus, addr, basename_of(d)});
     }
     return out;
+}
+
+// Optional user map: USB port-path → legend label (which accelerator's rail this
+// INA228 measures). File: $MB_INA228_CONFIG, else
+// $XDG_CONFIG_HOME/mb-powermon-gui/ina228.conf, else ~/.config/…. Lines are
+// "<port> = <label>", '#' starts a comment. Missing file → empty map (probes
+// fall back to "INA228#<n>").
+inline std::map<std::string, std::string> load_label_map() {
+    std::string path;
+    if (const char* e = std::getenv("MB_INA228_CONFIG")) {
+        path = e;
+    } else {
+        std::string base;
+        if (const char* x = std::getenv("XDG_CONFIG_HOME")) base = x;
+        else if (const char* h = std::getenv("HOME")) base = std::string(h) + "/.config";
+        if (!base.empty()) path = base + "/mb-powermon-gui/ina228.conf";
+    }
+    std::map<std::string, std::string> m;
+    if (path.empty()) return m;
+    std::ifstream f(path);
+    if (!f) return m;
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string line;
+    while (std::getline(f, line)) {
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trim(line.substr(0, eq)), val = trim(line.substr(eq + 1));
+        if (!key.empty() && !val.empty()) m[key] = val;
+    }
+    return m;
 }
 }  // namespace ftdi
 
@@ -814,9 +852,15 @@ inline std::vector<Loc> enumerate_bridges() {
 // the accelerator — it measures the rail, never touches the NPU.
 class INA228Probe : public DeviceProbe {
 public:
-    INA228Probe(int usb_bus, int usb_addr, int index)
-        : usb_bus_(usb_bus), usb_addr_(usb_addr) {
-        name_ = "INA228#" + std::to_string(index);
+    // `label` (from the config file, keyed on `port`) names the accelerator whose
+    // rail this INA228 measures; the legend row reads "INA228 - <label>" so the
+    // sensor is always identifiable. Unmapped bridges fall back to "INA228#<n>".
+    INA228Probe(int usb_bus, int usb_addr, std::string port, std::string label,
+                int index)
+        : usb_bus_(usb_bus), usb_addr_(usb_addr), port_(std::move(port)) {
+        name_ = label.empty() ? "INA228#" + std::to_string(index)
+                              : "INA228 - " + label;
+        color_alias_ = label;  // share the mapped accelerator's swatch, if present
     }
     const char* name() const override { return name_.c_str(); }
 
@@ -848,9 +892,7 @@ public:
                 std::snprintf(l, sizeof l, "%s 0x%02X", name_.c_str(), sensors_[i].addr);
                 power_metrics_[i].label = l;
             }
-        char loc[24];
-        std::snprintf(loc, sizeof loc, "usb %d-%d", usb_bus_, usb_addr_);
-        bdf_ = loc;
+        bdf_ = "usb " + port_;  // stable physical-port locator (e.g. "usb 1-1")
         std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle
         return true;
     }
@@ -865,7 +907,7 @@ public:
 
 private:
     int usb_bus_, usb_addr_;
-    std::string name_;
+    std::string port_, name_;
     std::unique_ptr<ftdi::Ft232hI2c> bus_;
     std::vector<ftdi::Ina228> sensors_;
 };
@@ -936,13 +978,17 @@ void Probes::discover(std::vector<std::string>* notes) {
         try_add(std::move(p), ok);
     }
 #if MB_HAVE_FTDI
-    // One probe per FT232H bridge (each carries an INA228). No serials here, so
-    // they're numbered by enumeration order; a future config file maps each to
-    // an accelerator.
+    // One probe per FT232H bridge (each carries an INA228). Bridges have no
+    // serials, so the config file maps each by its stable USB port-path to an
+    // accelerator label; unmapped bridges fall back to "INA228#<n>".
     {
+        auto labels = ftdi::load_label_map();
         int idx = 0;
         for (const auto& br : ftdi::enumerate_bridges()) {
-            auto p = std::make_unique<INA228Probe>(br.bus, br.addr, idx++);
+            auto it = labels.find(br.port);
+            std::string label = (it != labels.end()) ? it->second : std::string();
+            auto p = std::make_unique<INA228Probe>(br.bus, br.addr, br.port,
+                                                   label, idx++);
             bool ok = p->discover();
             try_add(std::move(p), ok);
         }
@@ -952,21 +998,75 @@ void Probes::discover(std::vector<std::string>* notes) {
     flatten();
 }
 
+// Device order for the *power* section: an aliased device (a mapped INA228) is
+// grouped just before the device it names, and the INA228 comes first. So
+// "INA228 - Hailo" sits immediately above "Hailo". Everything else keeps
+// discovery order. (Temperature stays plain discovery order — INA228 has none.)
+std::vector<size_t> Probes::power_device_order() const {
+    std::vector<size_t> order;
+    std::vector<bool> done(devices_.size(), false);
+    for (size_t k = 0; k < devices_.size(); ++k) {
+        if (!devices_[k]->color_alias().empty()) continue;  // placed via its target
+        for (size_t a = 0; a < devices_.size(); ++a)        // INA228s aliased to k, first
+            if (!done[a] && devices_[a]->color_alias() == devices_[k]->name()) {
+                order.push_back(a);
+                done[a] = true;
+            }
+        order.push_back(k);
+        done[k] = true;
+    }
+    for (size_t a = 0; a < devices_.size(); ++a)  // any alias that matched nothing
+        if (!done[a]) order.push_back(a);
+    return order;
+}
+
+// If devices_[k] is a mapped INA228 (color_alias set) whose named accelerator is
+// present *and* a PCIe (M.2) device, return that accelerator's index — the INA228
+// reading should fold onto its row so the row's max spans both the on-die and
+// shunt readings. Otherwise -1 (the INA228 keeps its own standalone row).
+int Probes::pcie_merge_target(size_t k) const {
+    const std::string& alias = devices_[k]->color_alias();
+    if (alias.empty()) return -1;
+    static const std::regex pcie(
+        R"(^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$)");
+    for (size_t j = 0; j < devices_.size(); ++j)
+        if (j != k && devices_[j]->name() == alias &&
+            std::regex_match(devices_[j]->bdf(), pcie))
+            return static_cast<int>(j);
+    return -1;
+}
+
 void Probes::flatten() {
     temp_metrics_.clear();
     power_metrics_.clear();
-    for (size_t k = 0; k < devices_.size(); ++k) {
-        auto& d = devices_[k];
-        for (auto m : d->temp_metrics()) {
-            m.device = static_cast<int>(k);
-            m.device_name = d->name();
-            m.bdf = d->bdf();
+    auto stamp = [](MetricInfo& m, size_t k, DeviceProbe* d) {
+        m.device = static_cast<int>(k);
+        m.device_name = d->name();
+        m.bdf = d->bdf();
+        m.color_alias = d->color_alias();
+    };
+    for (size_t k = 0; k < devices_.size(); ++k)
+        for (auto m : devices_[k]->temp_metrics()) {
+            stamp(m, k, devices_[k].get());
             temp_metrics_.push_back(std::move(m));
         }
-        for (auto m : d->power_metrics()) {
-            m.device = static_cast<int>(k);
-            m.device_name = d->name();
-            m.bdf = d->bdf();
+    // Power in grouped order (power_device_order places a mapped INA228 right
+    // before its accelerator). A PCIe-mapped INA228 folds onto that accelerator:
+    // its metric takes the accelerator's device / name / bdf (so it shares the
+    // row, color, and per-device max) and is labelled "<accel> INA228".
+    power_dev_order_ = power_device_order();
+    for (size_t k : power_dev_order_) {
+        int tgt = pcie_merge_target(k);
+        for (auto m : devices_[k]->power_metrics()) {
+            if (tgt >= 0) {
+                m.device = tgt;
+                m.device_name = devices_[tgt]->name();
+                m.bdf = devices_[tgt]->bdf();
+                m.color_alias.clear();
+                m.label = std::string(devices_[tgt]->name()) + " INA228";
+            } else {
+                stamp(m, k, devices_[k].get());
+            }
             power_metrics_.push_back(std::move(m));
         }
     }
@@ -976,9 +1076,10 @@ void Probes::flatten() {
 
 void Probes::poll() {
     for (auto& d : devices_) d->poll();
-    size_t ti = 0, pi = 0;
-    for (auto& d : devices_) {
+    size_t ti = 0;
+    for (auto& d : devices_)
         for (double v : d->temp_values()) temp_values_[ti++] = v;
-        for (double v : d->power_values()) power_values_[pi++] = v;
-    }
+    size_t pi = 0;  // power_values_ is aligned to power_metrics_ (reordered)
+    for (size_t k : power_dev_order_)
+        for (double v : devices_[k]->power_values()) power_values_[pi++] = v;
 }
