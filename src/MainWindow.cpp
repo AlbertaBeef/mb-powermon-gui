@@ -21,7 +21,7 @@
 
 namespace {
 constexpr int kIntervalMs = 1000;
-constexpr int kSpanSeconds = 60;
+constexpr int kSpanSeconds = 600;  // 10 min of history on every graph
 constexpr int kHistory = kSpanSeconds + 1;
 constexpr double kTempAxisMax = 100.0;  // °C, matches mb-powermon's default
 

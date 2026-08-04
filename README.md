@@ -10,11 +10,12 @@ native desktop window.
 
 ## What it shows
 
-Two sections, each a scrolling 60-second graph with a per-device legend of live
+Two sections, each a scrolling 10-minute graph with a per-device legend of live
 values:
 
 - **Power** (W) — one trace per power reading, 10 W default axis (auto-expands).
-- **Temperature** (°C) — one trace per on-die sensor, fixed 0–100 °C axis.
+- **Temperature** (°C) — one trace per on-die sensor, 0–100 °C axis that expands
+  if a sensor goes above 100.
 
 Every metric from a given card shares that card's color, kept consistent across
 both graphs, and the legend groups metrics **one device per row** (prefixed with
@@ -219,16 +220,46 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
 
   The Temperature section is unaffected (INA228 has no temperature).
 
+## Desktop integration
+
+`mb-powermon-gui.desktop` is a ready launcher; it points `Exec` at
+`build/mb-powermon`, so the repo has to stay where it is (or edit the path). Its
+visible label is `Name=mb-powermon` — short on purpose, since a longer one wraps
+to a second line under the desktop icon; the descriptive wording lives in
+`GenericName`/`Comment`, which is what feeds the tooltip and menu search. The
+icon is `M_logo`, distinct from the sibling `mb-benchmark-gui`'s
+`M_benchmarking`, so the two apps are told apart in the launcher.
+
+```bash
+# application menu
+install -Dm644 mb-powermon-gui.desktop ~/.local/share/applications/mb-powermon-gui.desktop
+update-desktop-database ~/.local/share/applications
+
+# icon
+install -Dm644 assets/M_logo.svg ~/.local/share/icons/hicolor/scalable/apps/M_logo.svg
+gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
+```
+
+A launcher on the desktop itself needs mode 755 **and** to be marked trusted, or
+GNOME's `ding` extension renders it as a plain text file — and editing it in
+place later rewrites the file, so re-apply both after any change:
+
+```bash
+install -m 755 mb-powermon-gui.desktop ~/Desktop/
+gio set ~/Desktop/mb-powermon-gui.desktop metadata::trusted true
+```
+
 ## Design
 
-- **Sampling** runs once per second; each graph keeps a 60-second (61-point)
+- **Sampling** runs once per second; each graph keeps a 10-minute (601-point)
   history and draws newest-on-the-right. The per-device summary (avg temp / max
   power) is recomputed each tick, skipping any `NaN` readings.
-- **Colors** come only from the project brand palette: device series take the
-  **accent** colors in discovery order (Amber, Slate Blue, Sage, Plum, then Sand;
-  Coral is reserved for alerts), so on a host with all backends present that runs
-  Hailo → DeepX → MemryX → Axelera → Qualcomm IQ, and on a host with only one
-  device that device is Amber. Graph chrome uses the **neutrals** (Slate Gray
+- **Colors** come only from the project brand palette, and each accelerator has a
+  **fixed** one — Coral = Hailo, Sage = MemryX, Slate Blue = DeepX, Amber =
+  Axelera, Plum = Qualcomm — assigned by `util::device_accent()` rather than by
+  discovery order, so a card looks the same here, in `mb-benchmark-gui`, and on a
+  host where only some of the backends are present. Anything unmatched falls back
+  to the cycling accent palette. Graph chrome uses the **neutrals** (Slate Gray
   grid/text, near-white plot), and the title bar is the brand Teal.
 - Missing readings render as gaps in the trace and `—` in the legend.
 
@@ -237,7 +268,7 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
 | File | Role |
 | ---- | ---- |
 | `src/Probes.{h,cpp}` | device discovery + per-tick telemetry (HailoRT / `dxrt-cli` / sysfs / `triton_trace` / MemryX helper / `nsp-*-thermal` zones / INA228 over FT232H via libftdi1). No GTK dependency. |
-| `src/GraphArea.{h,cpp}` | reusable Cairo scrolling multi-series graph (fixed or auto axis, NaN gaps, height-responsive) |
+| `src/GraphArea.{h,cpp}` | reusable Cairo scrolling multi-series graph (auto axis with 10 % headroom, NaN gaps, height-responsive) |
 | `src/MainWindow.{h,cpp}` | the two sections, device-grouped legend, teal header bar, 1 Hz refresh |
 | `src/util.h` | brand palette (accent + neutral), size/rate formatting, nice-axis rounding |
 | `src/main.cpp` | `Gtk::Application` entry point |

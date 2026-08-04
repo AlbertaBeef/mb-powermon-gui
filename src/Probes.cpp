@@ -30,6 +30,23 @@ namespace {
 
 const double kNaN = std::nan("");
 
+// A die temperature outside this band is not a measurement, it is a driver
+// sentinel. The MX3 publishes 65262000 (= -274 °C read as unsigned 16-bit,
+// just below absolute zero) on every sensor once the chip stops answering
+// admin commands — `memryx: admin timeout ... subop 17` in dmesg. Reporting
+// that verbatim is worse than reporting nothing: since no graph clips its data
+// any more, one bogus sample re-tops the temperature axis at ~72000 °C and
+// squashes every real card into the bottom pixel row. NaN draws as a gap and
+// leaves the axis alone, which is what "this sensor has no reading" should
+// look like.
+constexpr double kTempMinPlausible = -40.0;
+constexpr double kTempMaxPlausible = 150.0;
+
+inline double plausible_temp(double c) {
+    return (c >= kTempMinPlausible && c <= kTempMaxPlausible) ? c : kNaN;
+}
+
+
 std::string read_file(const std::string& path) {
     std::ifstream f(path);
     if (!f) return {};
@@ -280,7 +297,8 @@ public:
             std::string raw = read_file(hwmon_ + "/temp" +
                                         std::to_string(slots_[i]) + "_input");
             try {
-                temp_values_[i] = raw.empty() ? kNaN : std::stod(raw) / 1000.0;
+                temp_values_[i] =
+                    raw.empty() ? kNaN : plausible_temp(std::stod(raw) / 1000.0);
             } catch (...) {
                 temp_values_[i] = kNaN;
             }
@@ -528,7 +546,10 @@ public:
                 std::string raw = read_file(p);
                 if (raw.empty()) continue;
                 try {
-                    double c = std::stod(raw) / 1000.0;
+                    // Gate before the max: a sentinel would otherwise always
+                    // win and become this zone's reported temperature.
+                    double c = plausible_temp(std::stod(raw) / 1000.0);
+                    if (std::isnan(c)) continue;
                     if (std::isnan(best) || c > best) best = c;
                 } catch (...) {
                 }
@@ -601,7 +622,8 @@ public:
     void poll() override {
         std::string raw = read_file(path_);
         try {
-            temp_values_[0] = raw.empty() ? kNaN : std::stod(raw) / 1000.0;
+            temp_values_[0] =
+                raw.empty() ? kNaN : plausible_temp(std::stod(raw) / 1000.0);
         } catch (...) {
             temp_values_[0] = kNaN;
         }

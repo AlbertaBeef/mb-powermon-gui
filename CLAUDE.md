@@ -10,6 +10,12 @@ Monitor** (Resources tab). It is the GUI counterpart to the sibling Python TUI i
 `../mb-powermon` (largely the same telemetry, different presentation) — they
 share the theme but **no code**.
 
+Window title: **"NPU Power and Temperature Monitoring GUI"**. Binary:
+`./build/mb-powermon`. The **launcher label is different and deliberately so** —
+`Name=mb-powermon` in the `.desktop`, because the descriptive title wraps to two
+lines under a desktop icon. That label matches the sibling TUI's project name;
+it is only a display string, and nothing dispatches on it.
+
 Coverage is no longer identical: the GUI has a **Qualcomm IQ** (on-SoC Hexagon
 NSP) probe that the TUI lacks, and both now read **INA228** external power over an
 FT232H bridge (the GUI via **libftdi1** in C++, the TUI via Adafruit Blinka in
@@ -18,7 +24,7 @@ Port in either direction as needed — the two have no shared code, so it is a
 reimplementation, not a move.
 
 The UI is deliberately simple: **two sections, Power and Temperature**, each a
-scrolling 60 s time-series graph with a per-device legend of live values. Each
+scrolling 10 min time-series graph with a per-device legend of live values. Each
 legend row also shows a **per-device summary** between the device name and its
 individual entries: temperature averages its sensors (`avg 60°C`), power takes
 the max of its readings (`max 0.93 W`). It does **not** show
@@ -88,9 +94,19 @@ Clean split between data and UI — keep it that way.
     **POWER register is full 24-bit — no `>>4`** (unlike VBUS/VSHUNT/CURRENT). See
     gotchas for the identity problem.
 - **`GraphArea`** (`src/GraphArea.{h,cpp}`) — reusable Cairo `DrawingArea`.
-  Percent / fixed-max (°C) / auto-scale (W, nice-rounded, `min_axis_max` floor)
-  modes; axis labels at 0/25/50/75/100 %; newest sample on the right; NaN breaks
-  the polyline into gaps. `vexpand` so graphs grow with the window.
+  Percent / fixed-max (°C) / auto-scale (W, `min_axis_max` floor) modes; axis
+  labels at 0/25/50/75/100 %; newest sample on the right; NaN breaks the
+  polyline into gaps. `vexpand` so graphs grow with the window.
+  **Every mode's top is a baseline, not a cap** — `current_axis_max()` re-tops
+  the axis at `kHeadroom` (1.10) × the peak the moment any reading reaches the
+  baseline, so no graph clips its own data. That is why the °C axis is no longer
+  pinned at 100: a die past 100 used to draw as a flat line on the top edge,
+  indistinguishable from one sitting exactly at 100. The expanded top is
+  deliberately **not** `nice_ceil`-rounded — quantizing 1370 up to 2000 would
+  leave the trace in the bottom half of the plot, which is the readability
+  problem the headroom rule exists to fix. (`nice_ceil` is consequently no
+  longer called from `GraphArea`; it stays in `util.h`, which is shared verbatim
+  and must not diverge.)
 - **`MainWindow`** (`src/MainWindow.{h,cpp}`) — builds the two `Gtk::Expander`
   sections, the device-grouped legend, the teal `Gtk::HeaderBar`, and the 1 Hz
   `Glib::signal_timeout` that pushes samples and updates labels. The shared
@@ -103,7 +119,8 @@ Clean split between data and UI — keep it that way.
   `INA228` (shunt), its `max` the larger; Axelera's lone `INA228` gives it its first
   power number.
 - **`util.h`** — the brand palette (accent + neutral), size/rate formatting,
-  `nice_ceil`, and `make_palette` (returns **accent colors**, cycled).
+  `nice_ceil` (kept for reuse; `GraphArea` no longer calls it), and
+  `make_palette` (returns **accent colors**, cycled).
 
 To add a metric: extend a probe (or add a new `DeviceProbe`), then it flows into
 the graphs/legend automatically — the UI is metric-agnostic.
@@ -116,13 +133,23 @@ the graphs/legend automatically — the UI is metric-agnostic.
   passive. Don't make the other backends intrusive without a reason.
 - **Per-device color.** Every metric of a device uses one color from the brand
   **accent** palette (`m.device` indexes `device_palette_`), consistent across
-  both graphs. `MainWindow::colors_for()` maps metrics → colors. A device may set
+  both graphs. `MainWindow::colors_for()` maps metrics → colors. Each accelerator
+  has a **fixed** colour from `util::device_accent()` — Coral = Hailo, Sage =
+  MemryX, Slate Blue = DeepX, Amber = Axelera, Plum = Qualcomm — applied over
+  `device_palette_` after `make_palette()`, so a card is the same colour here and
+  in `mb-benchmark-gui` (`util.h` is shared verbatim; change it in both).
+  Ordering subtlety: the fixed colour is applied **before** the INA228 alias
+  pass, so a mapped shunt inherits its card's colour rather than a palette slot.
+  The Qualcomm NSP names itself after the board (`IQ9075`, `QCS9075`, …), so
+  `device_accent()` matches those forms too while excluding the separate
+  `"<board> Board"` ambient probe (any name containing a space). A device may set
   `color_alias_` to another device's name to **share its swatch** (a mapped INA228
   reuses its accelerator's color); the ctor remaps `device_palette_` after
   `make_palette()` by matching `color_alias` → device name.
 - **Colors come only from the brand palette** (`util::accent` / `util::neutral`).
-  Accent = series (Amber, Slate Blue, Sage, Plum; Coral reserved for alerts, Sand
-  for fills). Neutral = graph chrome (Slate Gray grid/text, `#FAFAFA` plot bg —
+  Accent = series (Coral, Sage, Slate Blue, Amber, Plum; Sand for fills — Coral
+  is *not* reserved for alerts, it is Hailo's fixed colour). Neutral = graph
+  chrome (Slate Gray grid/text, `#FAFAFA` plot bg —
   intentionally the original near-white, not pure white). Title bar = Teal via an
   app-scoped `Gtk::CssProvider`. Don't reintroduce ad-hoc RGB.
 - **Legend** is one row per device: `<bdf> <b>Name</b>`, then the optional
@@ -131,8 +158,10 @@ the graphs/legend automatically — the UI is metric-agnostic.
   stripped from each label). Keep `value_labels_out` in metric order for the tick
   to update; the aggregate labels ride in a parallel `AggEntry` vector.
 - Refresh cadence / history are the `k*` constants at the top of
-  `MainWindow.cpp` (`kIntervalMs`, `kSpanSeconds`, `kHistory = span + 1`,
-  `kTempAxisMax = 100`). Power axis floor is `set_min_axis_max(10.0)`.
+  `MainWindow.cpp` (`kIntervalMs`, `kSpanSeconds` = 600, `kHistory = span + 1`,
+  `kTempAxisMax = 100`). Power axis floor is `set_min_axis_max(10.0)`. Both are
+  **baselines**: a reading that reaches either grows the axis to 10 % above the
+  peak (`kHeadroom` in `GraphArea.cpp`).
 
 ## Per-device gotchas
 
@@ -240,6 +269,37 @@ the graphs/legend automatically — the UI is metric-agnostic.
   `/dev/ttyUSB*` being present is harmless). The `poll()` reads run on the GUI
   thread (~tens of ms for two sensors over MPSSE at 100 kHz); fine at this scale,
   move to a worker thread if many bridges are added.
+
+## Desktop entry
+
+`mb-powermon-gui.desktop` uses `Icon=M_logo`, *not* the `M_benchmarking` that the
+sibling `mb-benchmark-gui` uses — otherwise the two apps are indistinguishable in
+the launcher. `Name` is **`mb-powermon`**, deliberately short: anything longer
+wraps to a second line under the desktop icon (it was "NPU Power & Temperature
+Monitor", then "mb-powermon-gui" — both wrapped). Keep the descriptive wording in
+`GenericName`/`Comment`, which is what feeds the tooltip and menu search.
+`Categories` is `System;Monitor;` only — a second *main* category makes the app
+appear twice in the menu, which `desktop-file-validate` warns about. A launcher
+in `~/Desktop` needs mode 755 **and** `gio set … metadata::trusted true`, or
+GNOME's `ding` extension renders it as a text file; editing it in place rewrites
+the file, so re-apply both afterwards.
+
+## Known issues
+
+- **`BrokenPipeError: [Errno 32] Broken pipe` traceback on exit.** Cosmetic and
+  not this app's own code: the MemryX power helper subprocess writes to a pipe
+  the parent has already closed, and Python prints the traceback to the stderr it
+  inherited from us. **Fixed in `mb-benchmark-gui` and not yet ported here** —
+  its helper calls `os._exit(0)` on write failure, which skips both the traceback
+  *and* the interpreter's shutdown flush (a plain `break`/`sys.exit` still emits
+  "Exception ignored"). `Probes.cpp` is shared between the two repos, so this is
+  a one-line port from `../mb-benchmark-gui/src/Probes.cpp`.
+- **The helper can outlive a hard kill.** `SIGTERM`ing the app leaves the venv
+  `python3` helper orphaned and still holding the MemryX device; `prctl(
+  PR_SET_PDEATHSIG)` in the child would close it. In `mb-benchmark-gui` this has
+  a worse consequence (its binary links `libmemx`, whose ELF constructor then
+  blocks in `memx_fops_open` *before* `main()`, so every subsequent launch
+  hangs); this app links no MemryX library and is not exposed to that.
 
 ## Build / verify
 
