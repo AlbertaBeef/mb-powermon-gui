@@ -97,16 +97,27 @@ Clean split between data and UI — keep it that way.
   Percent / fixed-max (°C) / auto-scale (W, `min_axis_max` floor) modes; axis
   labels at 0/25/50/75/100 %; newest sample on the right; NaN breaks the
   polyline into gaps. `vexpand` so graphs grow with the window.
-  **Every mode's top is a baseline, not a cap** — `current_axis_max()` re-tops
-  the axis at `kHeadroom` (1.10) × the peak the moment any reading reaches the
-  baseline, so no graph clips its own data. That is why the °C axis is no longer
-  pinned at 100: a die past 100 used to draw as a flat line on the top edge,
-  indistinguishable from one sitting exactly at 100. The expanded top is
-  deliberately **not** `nice_ceil`-rounded — quantizing 1370 up to 2000 would
-  leave the trace in the bottom half of the plot, which is the readability
-  problem the headroom rule exists to fix. (`nice_ceil` is consequently no
-  longer called from `GraphArea`; it stays in `util.h`, which is shared verbatim
-  and must not diverge.)
+  **`GraphArea::RangeMode` decides what the data does to the axis** — `Fixed`
+  (baseline only, clips), `Max` (**default**, baseline until a reading reaches it
+  then `kHeadroom` = 1.10 × peak, never shrinking back) or `Dynamic` (both ends
+  track the data, margin = 10 % of the span). `axis_range(lo, hi)` returns both
+  ends and `draw()` maps through them, so the bottom gridline is `lo`, not 0.
+  `set_series_visible()` hides a series without discarding its history and drops
+  it from the range calculation.
+
+  **This app exposes no control for either** — it takes the `Max` default, which
+  is exactly the behaviour it had before. The API exists because `GraphArea` is
+  byte-identical with `mb-benchmark-gui`, which drives both from its Graphs
+  section. Keep the file identical (`cmp` after any change) rather than trimming
+  the unused parts.
+
+  Consequence of the `Max` default: the °C axis is no longer pinned at 100. A die
+  past 100 used to draw as a flat line on the top edge, indistinguishable from one
+  sitting exactly at 100. The expanded top is deliberately **not**
+  `nice_ceil`-rounded — quantizing 1370 up to 2000 would leave the trace in the
+  bottom half of the plot, which is the readability problem the headroom rule
+  exists to fix. (`nice_ceil` is consequently no longer called from `GraphArea`;
+  it stays in `util.h`, which is shared verbatim and must not diverge.)
 - **`MainWindow`** (`src/MainWindow.{h,cpp}`) — builds the two `Gtk::Expander`
   sections, the device-grouped legend, the teal `Gtk::HeaderBar`, and the 1 Hz
   `Glib::signal_timeout` that pushes samples and updates labels. The shared
@@ -118,6 +129,15 @@ Clean split between data and UI — keep it that way.
   raise that row's `max` — realized: a Hailo row shows both `POW` (firmware) and
   `INA228` (shunt), its `max` the larger; Axelera's lone `INA228` gives it its first
   power number.
+- **Sensor readings are plausibility-gated.** `plausible_temp()` maps anything
+  outside -40…150 °C to NaN at all three hwmon parse sites (MemryX, the Qualcomm
+  NSP zones, the board ambient probe). A wedged MX3 publishes `65262000`
+  millidegrees on every sensor — -274 °C read as unsigned 16-bit — and since the
+  axis no longer clips, one such sample would re-top the temperature graph at
+  ~72000 °C and squash every real card into the bottom pixel row. The Qualcomm
+  site matters independently: it takes a `max` across redundant TSENS taps, so an
+  ungated sentinel would always win. Don't "fix" this by clamping into range — a
+  fabricated number beside genuine readings is worse than a gap.
 - **`util.h`** — the brand palette (accent + neutral), size/rate formatting,
   `nice_ceil` (kept for reuse; `GraphArea` no longer calls it), and
   `make_palette` (returns **accent colors**, cycled).

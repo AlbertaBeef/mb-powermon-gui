@@ -26,6 +26,21 @@ GraphArea::GraphArea(int history, int span_seconds)
 void GraphArea::set_series(const std::vector<Gdk::RGBA>& colors) {
     colors_ = colors;
     series_.assign(colors.size(), std::deque<double>());
+    visible_.assign(colors.size(), true);
+}
+
+void GraphArea::set_series_visible(int i, bool on) {
+    if (i < 0 || i >= static_cast<int>(visible_.size())) return;
+    if (visible_[i] == on) return;
+    visible_[i] = on;
+    queue_draw();
+}
+
+void GraphArea::set_all_series_visible(bool on) {
+    bool changed = false;
+    for (size_t i = 0; i < visible_.size(); ++i)
+        if (visible_[i] != on) { visible_[i] = on; changed = true; }
+    if (changed) queue_draw();
 }
 
 void GraphArea::set_series_color(int i, const Gdk::RGBA& c) {
@@ -73,13 +88,16 @@ void GraphArea::axis_range(double& lo, double& hi) const {
                                  1e-9);
     double peak = 0.0, trough = 0.0;
     bool any = false;
-    for (const auto& s : series_)
+    for (size_t si = 0; si < series_.size(); ++si) {
+        if (si < visible_.size() && !visible_[si]) continue;
+        const auto& s = series_[si];
         for (double v : s) {
             if (std::isnan(v)) continue;
             if (!any) { peak = trough = v; any = true; continue; }
             peak = std::max(peak, v);
             trough = std::min(trough, v);
         }
+    }
 
     lo = 0.0;
     switch (range_mode_) {
@@ -205,6 +223,7 @@ void GraphArea::draw(const Cairo::RefPtr<Cairo::Context>& cr, int w, int h) {
     cr->clip();
     const double step = pw / std::max(1, history_ - 1);
     for (size_t s = 0; s < series_.size(); ++s) {
+        if (s < visible_.size() && !visible_[s]) continue;
         const auto& d = series_[s];
         if (d.size() < 2) continue;
         const int m = static_cast<int>(d.size());

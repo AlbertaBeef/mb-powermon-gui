@@ -19,6 +19,13 @@ public:
 
     void set_series(const std::vector<Gdk::RGBA>& colors);
     void set_series_color(int i, const Gdk::RGBA& c);
+    // Hide a series without discarding its history: it stops being drawn AND
+    // stops counting toward the axis range, so the visible traces get the whole
+    // plot. Filtering at draw time rather than at push() is what makes the
+    // change retroactive — masking new samples alone would leave the last ten
+    // minutes of hidden traces on screen.
+    void set_series_visible(int i, bool on);
+    void set_all_series_visible(bool on);
     int series_count() const { return static_cast<int>(series_.size()); }
 
     // Push one new sample per series (same order as set_series). Values are in
@@ -72,4 +79,5 @@ private:
 
     std::vector<std::deque<double>> series_;
     std::vector<Gdk::RGBA> colors_;
+    std::vector<bool> visible_;   // parallel to series_; all true by default
 };
