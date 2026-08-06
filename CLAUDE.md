@@ -292,7 +292,17 @@ the graphs/legend automatically — the UI is metric-agnostic.
 
 ## Desktop entry
 
-`mb-powermon-gui.desktop` uses `Icon=M_logo`, *not* the `M_benchmarking` that the
+**The desktop file is generated — edit `mb-powermon-gui.desktop.in`, not any
+`.desktop`.** It carries `Exec=@MB_EXEC@`; CMake `configure_file`s it twice, into
+`build/mb-powermon-gui.desktop` (points at `${CMAKE_INSTALL_FULL_BINDIR}`, and is
+what `cmake --install` ships, alongside the binary and `assets/M_logo.svg`) and
+`build/mb-powermon-gui.build.desktop` (points into the build tree, for running
+uninstalled). This replaced a committed absolute `Exec=/media/…` path that was
+one developer's machine and broken everywhere else — don't reintroduce a literal
+path. `CMAKE_INSTALL_PREFIX` must be set at *configure* time, since `Exec` is
+baked in then; `cmake --install --prefix` later would not match.
+
+`mb-powermon-gui.desktop.in` uses `Icon=M_logo`, *not* the `M_benchmarking` that the
 sibling `mb-benchmark-gui` uses — otherwise the two apps are indistinguishable in
 the launcher. `Name` is **`mb-powermon`**, deliberately short: anything longer
 wraps to a second line under the desktop icon (it was "NPU Power & Temperature

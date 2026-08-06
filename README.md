@@ -222,30 +222,42 @@ Quit by closing the window (or `Ctrl+C` in the terminal). Over SSH, prefix with
 
 ## Desktop integration
 
-`mb-powermon-gui.desktop` is a ready launcher; it points `Exec` at
-`build/mb-powermon`, so the repo has to stay where it is (or edit the path). Its
-visible label is `Name=mb-powermon` — short on purpose, since a longer one wraps
-to a second line under the desktop icon; the descriptive wording lives in
-`GenericName`/`Comment`, which is what feeds the tooltip and menu search. The
-icon is `M_logo`, distinct from the sibling `mb-benchmark-gui`'s
-`M_benchmarking`, so the two apps are told apart in the launcher.
+The launcher is generated, not hand-written: `mb-powermon-gui.desktop.in` carries
+`Exec=@MB_EXEC@`, and CMake substitutes a real absolute path at configure time.
+Nothing needs editing per machine. Its visible label is `Name=mb-powermon` —
+short on purpose, since a longer one wraps to a second line under the desktop
+icon; the descriptive wording lives in `GenericName`/`Comment`, which is what
+feeds the tooltip and menu search. The icon is `M_logo`, distinct from the
+sibling `mb-benchmark-gui`'s `M_benchmarking`, so the two apps are told apart in
+the launcher.
+
+Two entries come out of the build directory:
+
+| Generated file | `Exec` points at | Use |
+| -------------- | ---------------- | --- |
+| `mb-powermon-gui.desktop` | `${CMAKE_INSTALL_PREFIX}/bin/mb-powermon` | installed by `cmake --install` |
+| `mb-powermon-gui.build.desktop` | the binary in this build tree | running without installing |
+
+The normal path installs the binary, the entry and the icon together:
 
 ```bash
-# application menu
-install -Dm644 mb-powermon-gui.desktop ~/.local/share/applications/mb-powermon-gui.desktop
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/.local
+cmake --build build -j
+cmake --install build
 update-desktop-database ~/.local/share/applications
-
-# icon
-install -Dm644 assets/M_logo.svg ~/.local/share/icons/hicolor/scalable/apps/M_logo.svg
 gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
 ```
 
-A launcher on the desktop itself needs mode 755 **and** to be marked trusted, or
-GNOME's `ding` extension renders it as a plain text file — and editing it in
-place later rewrites the file, so re-apply both after any change:
+Set `CMAKE_INSTALL_PREFIX` at **configure** time — `Exec` is baked in then, so a
+prefix passed later to `cmake --install --prefix` would not match it.
+
+For an icon on the desktop itself, copy whichever entry you want (the installed
+one survives deleting the build tree). It needs mode 755 **and** to be marked
+trusted, or GNOME's `ding` extension renders it as a plain text file — and
+overwriting it later resets both, so re-apply them after any update:
 
 ```bash
-install -m 755 mb-powermon-gui.desktop ~/Desktop/
+install -m 755 ~/.local/share/applications/mb-powermon-gui.desktop ~/Desktop/
 gio set ~/Desktop/mb-powermon-gui.desktop metadata::trusted true
 ```
 

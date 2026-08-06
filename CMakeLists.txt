@@ -78,4 +78,29 @@ endif()
 target_compile_options(mb-powermon PRIVATE
   -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
-install(TARGETS mb-powermon RUNTIME DESTINATION bin)
+# --- Desktop entry + icon ---------------------------------------------------
+# Exec= is substituted at configure time from mb-powermon-gui.desktop.in, so no
+# one hand-edits an absolute path per machine (it used to ship one developer's
+# /media/... path, which was broken on every other host).
+#
+# Two entries are generated because there are two ways to run this:
+#   mb-powermon-gui.desktop          -> the installed binary; what `cmake
+#                                       --install` puts in the app menu
+#   mb-powermon-gui.build.desktop    -> the binary in this build tree, for
+#                                       running without installing (copy it to
+#                                       ~/Desktop; see README)
+include(GNUInstallDirs)
+
+set(MB_EXEC ${CMAKE_INSTALL_FULL_BINDIR}/mb-powermon)
+configure_file(mb-powermon-gui.desktop.in
+               ${CMAKE_CURRENT_BINARY_DIR}/mb-powermon-gui.desktop @ONLY)
+
+set(MB_EXEC ${CMAKE_CURRENT_BINARY_DIR}/mb-powermon)
+configure_file(mb-powermon-gui.desktop.in
+               ${CMAKE_CURRENT_BINARY_DIR}/mb-powermon-gui.build.desktop @ONLY)
+
+install(TARGETS mb-powermon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mb-powermon-gui.desktop
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+install(FILES assets/M_logo.svg
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
