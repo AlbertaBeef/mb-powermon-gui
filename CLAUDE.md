@@ -23,8 +23,12 @@ Python — no shared code). The TUI still has a **PMD2** meter probe the GUI lac
 Port in either direction as needed — the two have no shared code, so it is a
 reimplementation, not a move.
 
-The UI is deliberately simple: **two sections, Power and Temperature**, each a
-scrolling 10 min time-series graph with a per-device legend of live values. Each
+The UI is deliberately simple: **three sections — Power, Accumulated Energy and
+Temperature** — each a scrolling 10 min time-series graph with a per-device legend
+of live values. Accumulated Energy is collapsed by default and only exists when
+INA228 shunts are present; over a 10-minute window a monotonic accumulator draws a
+near-straight line whose *slope* is the average power the graph above already
+shows, so its worth is the absolute total on the legend. Each
 legend row also shows a **per-device summary** between the device name and its
 individual entries: temperature averages its sensors (`avg 60°C`), power takes
 the max of its readings (`max 0.93 W`). It does **not** show
@@ -41,9 +45,23 @@ Build with CMake; run `./build/mb-powermon` (needs a display).
 Clean split between data and UI — keep it that way.
 
 - **`Probes`** (`src/Probes.{h,cpp}`) — pure data, **no GTK include**. Discovers
-  every supported device and presents their metrics as two flat, stable lists
-  (`temp_metrics()` / `power_metrics()`), each with an aligned value vector
-  refreshed by `poll()`. A missing reading is `NaN`. Each `MetricInfo` carries
+  every supported device and presents their metrics as four flat, stable lists
+  (`temp_metrics()` / `power_metrics()` / `energy_metrics()` /
+  `charge_metrics()`), each with an aligned value vector refreshed by `poll()`.
+
+  **Energy and charge are separate families on purpose.** A `GraphArea` carries
+  one unit and one formatter, so joules and coulombs cannot share a plot: energy
+  is graphed, charge is read but not plotted. They also must not be merged into
+  `power_metrics_`, where the legend's per-device aggregate is a *max* — joules
+  would overtake watts within seconds and make that summary meaningless.
+
+  **`alias_device_order()` is shared by all four folded families** (it was
+  `power_device_order()` when power was the only one). A folded metric takes its
+  target's device index and the legend groups by *contiguous runs* of that index,
+  so a folded reading emitted in discovery order — the FTDI probes are discovered
+  last — would open a second legend row for a card that already has one. Using
+  one order for every family is also what lines the INA228 cells up in the same
+  legend column across graphs. A missing reading is `NaN`. Each `MetricInfo` carries
   `label`, `unit`, the owning `device` index, `device_name`, `bdf`, and
   `color_alias` — stamped in `Probes::flatten()`, not by the individual probes.
   Temp metrics follow discovery order; **power metrics use `power_device_order()`**,

@@ -48,12 +48,14 @@ private:
                                       GraphArea*& graph_out,
                                       std::vector<Gtk::Label*>& value_labels_out,
                                       const char* empty_note,
-                                      std::vector<AggEntry>* agg_out = nullptr);
+                                      std::vector<AggEntry>* agg_out = nullptr,
+                                      double min_axis_max = 10.0);
     // Per-metric colors: every metric of a device shares the device's color.
     std::vector<Gdk::RGBA> colors_for(const std::vector<MetricInfo>& metrics) const;
 
     std::vector<Gdk::RGBA> device_palette_;
-    Gtk::Expander& make_section(const char* title, Gtk::Widget& content);
+    Gtk::Expander& make_section(const char* title, Gtk::Widget& content,
+                                bool expanded = true);
 
     Probes probes_;
     std::int64_t last_time_us_ = 0;
@@ -67,4 +69,11 @@ private:
     GraphArea* temp_graph_ = nullptr;
     std::vector<Gtk::Label*> temp_values_;
     std::vector<AggEntry> temp_avg_labels_;
+
+    // Accumulated energy from the INA228 hardware accumulators. Stays null on a
+    // host with no shunts — the section is only built when the family is
+    // non-empty, and this would otherwise be a zero-series graph.
+    GraphArea* accum_graph_ = nullptr;
+    std::vector<Gtk::Label*> accum_values_;
+    std::vector<AggEntry> accum_sum_labels_;
 };

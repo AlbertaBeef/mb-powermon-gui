@@ -787,8 +787,12 @@ struct Ina228 {
     double current_lsb = 0.0;
     enum Reg : uint8_t {
         CONFIG = 0x00, ADC_CONFIG = 0x01, SHUNT_CAL = 0x02,
-        VBUS = 0x05, CURRENT = 0x07, POWER = 0x08, DEVICE_ID = 0x3F,
+        VBUS = 0x05, DIETEMP = 0x06, CURRENT = 0x07, POWER = 0x08,
+        ENERGY = 0x09, CHARGE = 0x0A, DEVICE_ID = 0x3F,
     };
+    // CONFIG bit 14. Writing it clears ENERGY and CHARGE; it is an ordinary R/W
+    // bit, so it has to be written back to 0 or the accumulators stay pinned.
+    static constexpr uint16_t kRstAcc = 0x4000;
     bool write_reg16(uint8_t reg, uint16_t v) {
         bus->start();
         bool ok = bus->write_byte((addr << 1) | 0) && bus->write_byte(reg) &&
@@ -807,14 +811,58 @@ struct Ina228 {
         return ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
     }
     uint32_t read24_raw20(uint8_t reg, bool* ok) { return read24(reg, ok) >> 4; }
+    // ENERGY and CHARGE are 40-bit. reg_read() already takes an arbitrary byte
+    // count, so this needs no new bus plumbing.
+    uint64_t read40(uint8_t reg, bool* ok) {
+        uint8_t b[5] = {0, 0, 0, 0, 0};
+        *ok = bus->reg_read(addr, reg, b, 5);
+        uint64_t v = 0;
+        for (int i = 0; i < 5; ++i) v = (v << 8) | b[i];
+        return v;
+    }
     bool configure(double shunt_res, double max_current) {
         current_lsb = max_current / 524288.0;  // 2^19
         uint16_t cal = (uint16_t)(13107200000.0 * current_lsb * shunt_res + 0.5);
+        // MODE 0xF is continuous bus + shunt + *temperature*, so DIETEMP is
+        // already being converted — reading it needs no config change.
         uint16_t adc = (0xF << 12) | (5 << 9) | (5 << 6) | (5 << 3) | 3;  // 0xFB6B
-        return write_reg16(CONFIG, 0x0000) && write_reg16(ADC_CONFIG, adc) &&
-               write_reg16(SHUNT_CAL, cal);
+        // Pulse RSTACC so the session's energy/charge series start at zero.
+        // This is a device-state write, like the Axelera collector level: a
+        // second client reading these accumulators would see them cleared. Kept
+        // because nothing else on either host touches them, and a series that
+        // began at an arbitrary carried-over value would be unreadable.
+        return write_reg16(CONFIG, kRstAcc) && write_reg16(CONFIG, 0x0000) &&
+               write_reg16(ADC_CONFIG, adc) && write_reg16(SHUNT_CAL, cal);
     }
     double power(bool* ok) { return read24(POWER, ok) * 3.2 * current_lsb; }  // W
+    // Monitor die temperature: signed 16-bit, 7.8125 m°C/LSB. A *full* 16-bit
+    // register, so read24_raw20() is the wrong helper — and read16() is
+    // unsigned, hence the cast.
+    double die_temp(bool* ok) {
+        return (int16_t)read16(DIETEMP, ok) * 0.0078125;  // °C
+    }
+    // 40-bit unsigned. LSB = 16 * 3.2 * current_lsb (488 uJ as configured), so
+    // it rolls over after ~3.4 years at 5 W — not a practical concern.
+    double energy(bool* ok) {
+        return (double)read40(ENERGY, ok) * 16.0 * 3.2 * current_lsb;  // J
+    }
+    // 40-bit *signed*: sign-extend from bit 39.
+    //
+    // On this rig all four shunts read NEGATIVE charge, and that is the harness,
+    // not a decode bug: measured 2026-08-08, P / |dQ/dt| comes out at 3.16-3.20 V
+    // on every rail — the M.2 3.3 V rail, consistent to 1%. So the magnitude is
+    // right and only the direction is flipped, because IN+/IN- are wired the
+    // other way round. POWER and ENERGY are unsigned registers, so they are
+    // unaffected and stay positive.
+    //
+    // Reported as measured rather than abs()'d: the sign is a real fact about
+    // the wiring, and silently discarding it would hide a rewire later. Divide
+    // by elapsed seconds for average current, and mind the sign.
+    double charge(bool* ok) {
+        uint64_t raw = read40(CHARGE, ok);
+        if (raw & (1ULL << 39)) raw |= ~((1ULL << 40) - 1);
+        return (double)(int64_t)raw * current_lsb;  // C
+    }
 };
 
 // Enumerate FT232H bridges via sysfs. `bus`/`addr` (busnum/devnum) open the
@@ -900,19 +948,38 @@ public:
             s.addr = a;
             if (!s.configure(0.015, 5.0)) continue;
             sensors_.push_back(s);
+            // All four families are declared here unconditionally, even though
+            // the first read has not happened yet. The Logger writes its header
+            // once at open, so a metric that only appeared after a successful
+            // read would lose its column for the whole session.
             power_metrics_.push_back({name_ + " POW", "W"});
             power_values_.push_back(kNaN);
+            temp_metrics_.push_back({name_ + " TEMP", "°C"});
+            temp_values_.push_back(kNaN);
+            energy_metrics_.push_back({name_ + " ENERGY", "J"});
+            energy_values_.push_back(kNaN);
+            charge_metrics_.push_back({name_ + " CHARGE", "C"});
+            charge_values_.push_back(kNaN);
         }
         if (sensors_.empty()) {
             note_ = "FT232H present but no INA228 responded";
             return false;
         }
         // If a bridge carries more than one sensor, disambiguate by I2C address.
+        // Every family is indexed by the same sensor index, so all four have to
+        // be relabelled together or they desynchronise.
         if (sensors_.size() > 1)
             for (size_t i = 0; i < sensors_.size(); ++i) {
-                char l[24];
-                std::snprintf(l, sizeof l, "%s 0x%02X", name_.c_str(), sensors_[i].addr);
-                power_metrics_[i].label = l;
+                char l[40];
+                auto tag = [&](const char* suffix) {
+                    std::snprintf(l, sizeof l, "%s 0x%02X %s", name_.c_str(),
+                                  sensors_[i].addr, suffix);
+                    return std::string(l);
+                };
+                power_metrics_[i].label = tag("POW");
+                temp_metrics_[i].label = tag("TEMP");
+                energy_metrics_[i].label = tag("ENERGY");
+                charge_metrics_[i].label = tag("CHARGE");
             }
         bdf_ = "usb " + port_;  // stable physical-port locator (e.g. "usb 1-1")
         std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle
@@ -924,6 +991,19 @@ public:
             bool ok = false;
             double p = sensors_[i].power(&ok);
             power_values_[i] = ok ? p : kNaN;
+            // NaN only on an I2C failure — never 0. Zero is a real reading here
+            // (0.0 W is the documented INA228 overflow signal, and a freshly
+            // reset accumulator genuinely reads 0 J), so the two must not be
+            // conflated. Same rule the Logger relies on.
+            ok = false;
+            const double t = sensors_[i].die_temp(&ok);
+            temp_values_[i] = ok ? plausible_temp(t) : kNaN;
+            ok = false;
+            const double j = sensors_[i].energy(&ok);
+            energy_values_[i] = ok ? j : kNaN;
+            ok = false;
+            const double c = sensors_[i].charge(&ok);
+            charge_values_[i] = ok ? c : kNaN;
         }
     }
 
@@ -1020,16 +1100,23 @@ void Probes::discover(std::vector<std::string>* notes) {
     flatten();
 }
 
-// Device order for the *power* section: an aliased device (a mapped INA228) is
-// grouped just before the device it names, and the INA228 comes first. So
-// "INA228 - Hailo" sits immediately above "Hailo". Everything else keeps
-// discovery order. (Temperature stays plain discovery order — INA228 has none.)
-std::vector<size_t> Probes::power_device_order() const {
+// Emission order that keeps an aliased device (a mapped INA228) adjacent to the
+// device it names. This is not cosmetic: a folded metric takes its target's
+// device index, and the legend groups by *contiguous runs* of that index — so a
+// folded reading emitted out of position would open a second legend row for a
+// card that already has one.
+//
+// The INA228 goes *before* its target, so a card's legend row reads
+// "INA228 · TS0 · TS1". Every folded family uses this one order, which is what
+// puts the INA228 cell in the same legend column on the Power, Temperature and
+// Accumulated Energy graphs — they are read side by side, so they have to line
+// up. Everything unaliased keeps discovery order.
+std::vector<size_t> Probes::alias_device_order() const {
     std::vector<size_t> order;
     std::vector<bool> done(devices_.size(), false);
     for (size_t k = 0; k < devices_.size(); ++k) {
         if (!devices_[k]->color_alias().empty()) continue;  // placed via its target
-        for (size_t a = 0; a < devices_.size(); ++a)        // INA228s aliased to k, first
+        for (size_t a = 0; a < devices_.size(); ++a)  // INA228s aliased to k, first
             if (!done[a] && devices_[a]->color_alias() == devices_[k]->name()) {
                 order.push_back(a);
                 done[a] = true;
@@ -1061,47 +1148,65 @@ int Probes::pcie_merge_target(size_t k) const {
 void Probes::flatten() {
     temp_metrics_.clear();
     power_metrics_.clear();
+    energy_metrics_.clear();
+    charge_metrics_.clear();
     auto stamp = [](MetricInfo& m, size_t k, DeviceProbe* d) {
         m.device = static_cast<int>(k);
         m.device_name = d->name();
         m.bdf = d->bdf();
         m.color_alias = d->color_alias();
     };
-    for (size_t k = 0; k < devices_.size(); ++k)
-        for (auto m : devices_[k]->temp_metrics()) {
-            stamp(m, k, devices_[k].get());
-            temp_metrics_.push_back(std::move(m));
-        }
-    // Power in grouped order (power_device_order places a mapped INA228 right
-    // before its accelerator). A PCIe-mapped INA228 folds onto that accelerator:
-    // its metric takes the accelerator's device / name / bdf (so it shares the
-    // row, color, and per-device max) and is labelled "<accel> INA228".
-    power_dev_order_ = power_device_order();
-    for (size_t k : power_dev_order_) {
-        int tgt = pcie_merge_target(k);
-        for (auto m : devices_[k]->power_metrics()) {
-            if (tgt >= 0) {
-                m.device = tgt;
-                m.device_name = devices_[tgt]->name();
-                m.bdf = devices_[tgt]->bdf();
-                m.color_alias.clear();
-                m.label = std::string(devices_[tgt]->name()) + " INA228";
-            } else {
-                stamp(m, k, devices_[k].get());
+
+    // A PCIe-mapped INA228 folds onto the accelerator it names: the metric takes
+    // that accelerator's device / name / bdf, so it shares the legend row, the
+    // colour and the per-device aggregate.
+    //
+    // `suffix` is what distinguishes the four families once folded — POWER /
+    // TEMP / ENERGY / CHARGE. They would otherwise all be "<accel> INA228".
+    auto emit = [&](const std::vector<MetricInfo>& (DeviceProbe::*get)() const,
+                    const char* suffix, std::vector<MetricInfo>& out) {
+        for (size_t k : dev_order_) {
+            const int tgt = pcie_merge_target(k);
+            for (auto m : (devices_[k].get()->*get)()) {
+                if (tgt >= 0) {
+                    m.device = tgt;
+                    m.device_name = devices_[tgt]->name();
+                    m.bdf = devices_[tgt]->bdf();
+                    m.color_alias.clear();
+                    m.label = std::string(devices_[tgt]->name()) + " INA228" + suffix;
+                } else {
+                    stamp(m, k, devices_[k].get());
+                }
+                out.push_back(std::move(m));
             }
-            power_metrics_.push_back(std::move(m));
         }
-    }
+    };
+
+    dev_order_ = alias_device_order();
+    emit(&DeviceProbe::temp_metrics, " TEMP", temp_metrics_);
+    emit(&DeviceProbe::power_metrics, " POWER", power_metrics_);
+    emit(&DeviceProbe::energy_metrics, " ENERGY", energy_metrics_);
+    emit(&DeviceProbe::charge_metrics, " CHARGE", charge_metrics_);
+
     temp_values_.assign(temp_metrics_.size(), kNaN);
     power_values_.assign(power_metrics_.size(), kNaN);
+    energy_values_.assign(energy_metrics_.size(), kNaN);
+    charge_values_.assign(charge_metrics_.size(), kNaN);
 }
 
 void Probes::poll() {
     for (auto& d : devices_) d->poll();
-    size_t ti = 0;
-    for (auto& d : devices_)
-        for (double v : d->temp_values()) temp_values_[ti++] = v;
-    size_t pi = 0;  // power_values_ is aligned to power_metrics_ (reordered)
-    for (size_t k : power_dev_order_)
-        for (double v : devices_[k]->power_values()) power_values_[pi++] = v;
+    // Each value vector is aligned to its own reordered metric list, so the fill
+    // has to walk the same order flatten() emitted in — not discovery order.
+    auto fill = [&](const std::vector<double>& (DeviceProbe::*get)() const,
+                    std::vector<double>& out) {
+        size_t i = 0;
+        for (size_t k : dev_order_)
+            for (double v : (devices_[k].get()->*get)())
+                if (i < out.size()) out[i++] = v;
+    };
+    fill(&DeviceProbe::temp_values, temp_values_);
+    fill(&DeviceProbe::power_values, power_values_);
+    fill(&DeviceProbe::energy_values, energy_values_);
+    fill(&DeviceProbe::charge_values, charge_values_);
 }

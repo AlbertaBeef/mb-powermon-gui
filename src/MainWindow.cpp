@@ -37,6 +37,12 @@ std::string fmt_power(double v) {
     std::snprintf(b, sizeof(b), "%.2f W", v);
     return b;
 }
+// Joules. Accumulates without bound over a session, so no fixed width.
+std::string fmt_joules(double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.1f", v);
+    return b;
+}
 std::string fmt_temp_axis(double v) {
     char b[16];
     std::snprintf(b, sizeof(b), "%.0f°C", v);
@@ -135,6 +141,30 @@ MainWindow::MainWindow() {
                              "external meter (INA228 / PMD2).",
                              &power_max_labels_)));
 
+    // Accumulated energy sits with Power because it is its integral. Built only
+    // when there are shunts: on a host with no libftdi the family is empty and
+    // this would be a zero-series graph.
+    //
+    // Collapsed by default. Over the graph's window a monotonic accumulator is
+    // a near-straight line whose slope is the average power — which the graph
+    // directly above already shows. Its worth is the absolute total, read off
+    // the legend.
+    if (!probes_.energy_metrics().empty()) {
+        root->append(make_section(
+            "Accumulated Energy",
+            build_metric_section(probes_.energy_metrics(),
+                                 colors_for(probes_.energy_metrics()),
+                                 /*percent_temp_axis=*/false, fmt_joules,
+                                 accum_graph_, accum_values_,
+                                 "No INA228 shunts, so nothing accumulates.",
+                                 &accum_sum_labels_,
+                                 // Low floor: the accumulator starts at zero, so
+                                 // a large axis would pin the trace to the
+                                 // bottom edge and read as an empty graph.
+                                 /*min_axis_max=*/10.0),
+            /*expanded=*/false));
+    }
+
     root->append(make_section(
         "Temperature",
         build_metric_section(probes_.temp_metrics(),
@@ -147,12 +177,13 @@ MainWindow::MainWindow() {
                                    kIntervalMs);
 }
 
-Gtk::Expander& MainWindow::make_section(const char* title, Gtk::Widget& content) {
+Gtk::Expander& MainWindow::make_section(const char* title, Gtk::Widget& content,
+                                        bool expanded) {
     auto* exp = Gtk::make_managed<Gtk::Expander>();
     auto* lbl = Gtk::make_managed<Gtk::Label>();
     lbl->set_markup(std::string("<b>") + title + "</b>");
     exp->set_label_widget(*lbl);
-    exp->set_expanded(true);
+    exp->set_expanded(expanded);
     exp->set_margin_top(4);
     // Only claim vertical space while expanded; a collapsed expander with
     // vexpand=true would keep its share of the window as an empty gap. Bind
@@ -188,7 +219,7 @@ Gtk::Widget& MainWindow::build_metric_section(
     const std::vector<MetricInfo>& metrics, const std::vector<Gdk::RGBA>& colors,
     bool temp_axis, std::function<std::string(double)> value_fmt,
     GraphArea*& graph_out, std::vector<Gtk::Label*>& value_labels_out,
-    const char* empty_note, std::vector<AggEntry>* agg_out) {
+    const char* empty_note, std::vector<AggEntry>* agg_out, double min_axis_max) {
     auto* box = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 8);
     box->set_vexpand(true);  // graph inside grows; legend keeps natural height
 
@@ -200,8 +231,12 @@ Gtk::Widget& MainWindow::build_metric_section(
         graph->set_fixed_max(kTempAxisMax);
         graph->set_value_formatter(fmt_temp_axis);
     } else {
-        graph->set_min_axis_max(10.0);  // default 10 W floor; auto-expands above
-        graph->set_value_formatter([](double v) { return fmt_power(v); });
+        // Auto-scaling with a floor. The formatter passed in decides the unit,
+        // so this same branch serves both the power and the energy graphs.
+        // (It used to hardcode fmt_power, which was harmless while power was
+        // the only caller and wrong the moment a second unit appeared.)
+        graph->set_min_axis_max(min_axis_max);
+        graph->set_value_formatter(value_fmt);
     }
     graph->set_series(std::vector<Gdk::RGBA>(colors.begin(), colors.begin() + n));
     box->append(*graph);
@@ -340,6 +375,26 @@ bool MainWindow::on_tick() {
             }
             a.label->set_text(std::isnan(best) ? "max —"
                                                : "max " + fmt_power(best));
+        }
+    }
+
+    // Accumulated energy. The row aggregate is a SUM, not power's max or
+    // temperature's mean: these are additive, so a card whose rail is split
+    // across two shunts should report the total it drew.
+    const auto& jv = probes_.energy_values();
+    if (accum_graph_ && !jv.empty() &&
+        static_cast<int>(jv.size()) == accum_graph_->series_count()) {
+        accum_graph_->push(jv);
+        for (size_t i = 0; i < accum_values_.size() && i < jv.size(); ++i)
+            accum_values_[i]->set_text(fmt_joules(jv[i]));
+        for (const auto& a : accum_sum_labels_) {
+            double sum = 0.0;
+            int cnt = 0;
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(jv.size()); ++k) {
+                if (!std::isnan(jv[k])) { sum += jv[k]; ++cnt; }
+            }
+            a.label->set_text(cnt ? "total " + fmt_joules(sum) : "total —");
         }
     }
 

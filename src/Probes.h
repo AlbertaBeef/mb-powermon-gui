@@ -48,20 +48,35 @@ public:
     const std::vector<double>& temp_values() const { return temp_values_; }
     const std::vector<MetricInfo>& power_metrics() const { return power_metrics_; }
     const std::vector<double>& power_values() const { return power_values_; }
+    // Accumulated energy (J) and charge (C) since discovery. Only the INA228
+    // shunts have these — they are hardware accumulators integrating at the ADC
+    // rate, not something derived from the 1 Hz samples.
+    //
+    // Two families rather than one, because a GraphArea carries a single unit
+    // and formatter: joules and coulombs cannot share a plot. Energy is graphed;
+    // charge is read but not plotted here.
+    const std::vector<MetricInfo>& energy_metrics() const { return energy_metrics_; }
+    const std::vector<double>& energy_values() const { return energy_values_; }
+    const std::vector<MetricInfo>& charge_metrics() const { return charge_metrics_; }
+    const std::vector<double>& charge_values() const { return charge_values_; }
 
 protected:
     std::vector<MetricInfo> temp_metrics_;
     std::vector<double> temp_values_;
     std::vector<MetricInfo> power_metrics_;
     std::vector<double> power_values_;
+    std::vector<MetricInfo> energy_metrics_;
+    std::vector<double> energy_values_;
+    std::vector<MetricInfo> charge_metrics_;
+    std::vector<double> charge_values_;
     std::string bdf_;
     std::string note_;
     std::string color_alias_;
 };
 
-// Discovers every supported device and presents their metrics as two flat,
-// stable lists (temperature and power). The lists are fixed after discover();
-// poll() only refreshes the aligned value vectors.
+// Discovers every supported device and presents their metrics as four flat,
+// stable lists (temperature, power, energy and charge). The lists are fixed
+// after discover(); poll() only refreshes the aligned value vectors.
 class Probes {
 public:
     // Detect devices and build the metric lists. `notes` (optional) collects
@@ -73,19 +88,31 @@ public:
     const std::vector<double>& temp_values() const { return temp_values_; }
     const std::vector<MetricInfo>& power_metrics() const { return power_metrics_; }
     const std::vector<double>& power_values() const { return power_values_; }
+    // Accumulated energy (J) / charge (C) from the INA228 shunts, folded onto
+    // the card each one measures. Empty on a host with no shunts.
+    const std::vector<MetricInfo>& energy_metrics() const { return energy_metrics_; }
+    const std::vector<double>& energy_values() const { return energy_values_; }
+    const std::vector<MetricInfo>& charge_metrics() const { return charge_metrics_; }
+    const std::vector<double>& charge_values() const { return charge_values_; }
 
     int device_count() const { return static_cast<int>(devices_.size()); }
 
 private:
     void flatten();
-    // Device order for the power section: a mapped INA228 grouped just before the
-    // accelerator it names (INA228 first). See Probes.cpp.
-    std::vector<size_t> power_device_order() const;
+    // Emission order that keeps a mapped INA228 immediately before the
+    // accelerator it names, so a folded reading joins that card's contiguous
+    // run (the legend groups by runs of MetricInfo::device — see Probes.cpp).
+    // Shared by every folded family, which is what lines the INA228 cells up in
+    // the same legend column across graphs.
+    std::vector<size_t> alias_device_order() const;
     // Accelerator index a PCIe-mapped INA228 should fold its reading onto, or -1.
     int pcie_merge_target(size_t k) const;
 
     std::vector<std::unique_ptr<DeviceProbe>> devices_;
     std::vector<MetricInfo> temp_metrics_, power_metrics_;
     std::vector<double> temp_values_, power_values_;
-    std::vector<size_t> power_dev_order_;  // devices_ indices, power emission order
+    std::vector<MetricInfo> energy_metrics_, charge_metrics_;
+    std::vector<double> energy_values_, charge_values_;
+    // devices_ indices, emission order for every folded family.
+    std::vector<size_t> dev_order_;
 };
