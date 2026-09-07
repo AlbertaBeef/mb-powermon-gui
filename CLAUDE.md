@@ -255,7 +255,14 @@ the graphs/legend automatically — the UI is metric-agnostic.
   So temps "just work" while a Voyager app runs (it loads firmware **and** starts the
   collector) and vanish when the box is rebooted and left idle. Full recovery recipe:
   the `mb-axelera` skill's `references/runtime.md`.
-- **Qualcomm IQ** — **there is no power telemetry on this board, and don't invent
+- **Qualcomm IQ** — the SoC still exposes no power sensor of its own, but the
+  board can now be measured from outside it: a **ChargerLAB POWER-Z KM003C**
+  inline on the USB-C supply, read by `PowerZProbe`. That is **whole-board**
+  power (CPU + GPU + NSP + DRAM + peripherals), so it lives in the
+  `sysvoltage_` / `syscurrent_` / `syspower_` families and its own **System**
+  graphs — never in the accelerator families, where a 19.9 V input or 22 W of
+  board draw would flatten the card traces beside it. Everything below still
+  holds for the SoC itself: **there is no on-board power telemetry, and don't invent
   one.** Measured on the IQ-9075 EVK, strongest evidence first:
   - **No power-monitor IC exists on any IQ-9075 variant.** Scanning all 331 DTBs
     under `/lib/firmware/<kver>/device-tree/qcom/` for INA/shunt compatibles, the

@@ -82,4 +82,16 @@ private:
     GraphArea* curr_graph_ = nullptr;
     std::vector<Gtk::Label*> curr_values_;
     std::vector<AggEntry> curr_absmax_labels_;
+    // Inline supply meter (POWER-Z): whole-board V / I / W, on their own graphs
+    // rather than as extra series on the accelerator ones — a 19.9 V board
+    // input or 22 W of board draw would flatten the card traces beside it.
+    GraphArea* sysvbus_graph_ = nullptr;
+    std::vector<Gtk::Label*> sysvbus_values_;
+    std::vector<AggEntry> sysvbus_min_labels_;
+    GraphArea* syscurr_graph_ = nullptr;
+    std::vector<Gtk::Label*> syscurr_values_;
+    std::vector<AggEntry> syscurr_absmax_labels_;
+    GraphArea* syspower_graph_ = nullptr;
+    std::vector<Gtk::Label*> syspower_values_;
+    std::vector<AggEntry> syspower_max_labels_;
 };

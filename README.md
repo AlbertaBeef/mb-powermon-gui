@@ -36,7 +36,8 @@ on-die `POW` and the shunt `INA228` reading, and the summary reports the larger.
 | **DeepX M1** | `T0`–`T2` via `dxrt-cli -s` (reads the kernel driver) | — (not exposed) | ✅ |
 | **MemryX MX3** | `T0`–`T3` via sysfs/hwmon | `POW` via the MemryX SDK over the `mxa-manager` daemon | ✅ (daemon-shared) |
 | **Axelera Metis** | `SYS` / `AI0`–`AI3` via `triton_trace --peek` | — (not exposed on M.2) | ✅ |
-| **Qualcomm IQ** (IQ-9075 / QCS9075) | `N0-0`–`N1-2` via the `nsp-*-thermal` sysfs zones | — (**no** power measurement exists on the board) | ✅ |
+| **Qualcomm IQ** (IQ-9075 / QCS9075) | `N0-0`–`N1-2` via the `nsp-*-thermal` sysfs zones | — (the SoC exposes none; see **POWER-Z** for whole-board watts) | ✅ |
+| **POWER-Z KM003C** | meter die temp | whole-board V / A / W from the inline USB-C supply meter, via the in-tree `powerz` hwmon driver | ✅ |
 | **IQ9075 Board** (ambient) | `AMB` via a TI TMP411 on i2c-19 0x4c (hwmon `temp1_input`) | — | ✅ |
 | **INA228** (external) | `INA228 TEMP` — the monitor's own die, i.e. ambient plus shunt self-heating, **not** the card's die | `INA228 POWER` (W) on an FT232H USB→I²C bridge (libftdi1 MPSSE), one probe per bridge, plus `INA228 VBUS` (V), `INA228 CURRENT` (A), and `INA228 ENERGY` (J) / `INA228 CHARGE` (C) from the chip's 40-bit hardware accumulators | ✅ (measures the rail, never touches the NPU) |
 

@@ -640,6 +640,114 @@ private:
     std::string path_;
 };
 
+// ---------------------------------------------------------------------------
+// ChargerLAB POWER-Z KM003C — a USB-C inline power meter on the board's own
+// supply. The in-tree `powerz` hwmon driver already binds its vendor interface
+// (bInterfaceClass ff), so this is plain sysfs: no libusb, no claim, nothing
+// that could fight the meter's own control app. Passive like every other probe
+// here.
+//
+// WHAT IT MEASURES IS THE WHOLE BOARD, NOT AN NPU. It sits in the USB-C supply
+// feeding the EVK, so it reads CPU + GPU + NSP + DRAM + peripherals together.
+// That is genuinely useful — it is the only real wattage available on the
+// IQ-9075, whose SoC exposes none — but it is NOT per-accelerator power, and it
+// must not be fed to `power_for_device()` as a card's draw. The device name
+// deliberately matches no `accel_name()`, which is what keeps it out: a card
+// with no rail of its own keeps reporting NaN and its efficiency figures stay
+// 0, rather than silently inheriting a board-level number ~10x its real draw.
+//
+// Verified on this EVK 2026-09-07 by loading eight CPU cores: 11.3 W idle ->
+// 22.5 W under load and back, with VBUS sagging 19.86 -> 19.75 V. So it really
+// is this board's supply, and the voltage/current/power ordering of the graphs
+// reads as cause then effect on it.
+//
+// Only VBUS/IBUS/TEMP are exposed. The driver also publishes in1..in5 (CC1,
+// CC2, D+, D-, and the meter's internal VDD) — USB-C signalling levels, not
+// board power. A 1.6 V CC line sharing the voltage graph with a 19.9 V bus
+// would squash the trace that matters, so they are left out on the same
+// principle as BoardThermalProbe's unlabelled remote diode.
+// ---------------------------------------------------------------------------
+class PowerZProbe : public DeviceProbe {
+public:
+    const char* name() const override { return name_.c_str(); }
+
+    bool discover() {
+        for (const auto& d : glob_paths("/sys/class/hwmon/hwmon*")) {
+            if (trim_sysfs(read_file(d + "/name")) != "powerz") continue;
+            if (read_file(d + "/in0_input").empty()) continue;
+            if (read_file(d + "/curr1_input").empty()) continue;
+            volt_path_ = d + "/in0_input";
+            curr_path_ = d + "/curr1_input";
+            if (!read_file(d + "/temp1_input").empty())
+                temp_path_ = d + "/temp1_input";
+            // Locator: the USB port path, matching the INA228 bridges' "usb
+            // <port>" form. Taken from the hwmon's own device path
+            // (.../usb3/3-1/3-1.4/3-1.4:1.0/hwmon/hwmonN) rather than by
+            // re-globbing, so it is the port this meter is actually on.
+            std::string real = realpath_of(d);
+            const std::string iface = ":1.0";
+            const size_t c = real.find(iface);
+            if (c != std::string::npos) {
+                const size_t b = real.rfind('/', c);
+                if (b != std::string::npos)
+                    bdf_ = "usb " + real.substr(b + 1, c - b - 1);
+            }
+            break;
+        }
+        if (volt_path_.empty()) return false;
+
+        sysvoltage_metrics_.push_back({name_ + " SYS VBUS", "V"});
+        syscurrent_metrics_.push_back({name_ + " SYS CURRENT", "A"});
+        syspower_metrics_.push_back({name_ + " SYS POWER", "W"});
+        sysvoltage_values_.assign(1, kNaN);
+        syscurrent_values_.assign(1, kNaN);
+        syspower_values_.assign(1, kNaN);
+        if (!temp_path_.empty()) {
+            temp_metrics_.push_back({name_ + " TEMP", "°C"});
+            temp_values_.assign(1, kNaN);
+        }
+        poll();
+        return true;
+    }
+
+    void poll() override {
+        const double v = read_scaled(volt_path_, 1000.0);   // mV -> V
+        // The KM003C reports IBUS **negative while the sink draws**, which is
+        // its orientation convention and not a wiring fault (contrast the
+        // INA228 rails, where reversed leads really were the bug and are fixed
+        // per-rail in ina228.conf). Negate so a board that is drawing reads
+        // positive, the way every other current in this app does.
+        const double i = -read_scaled(curr_path_, 1000.0);  // mA -> A
+        sysvoltage_values_[0] = v;
+        syscurrent_values_[0] = i;
+        // Magnitude, matching the INA228 POWER register, which is unsigned by
+        // hardware. Draw is unsigned regardless of which way round the meter is
+        // installed, so this stays right if someone reverses it.
+        syspower_values_[0] = (std::isnan(v) || std::isnan(i)) ? kNaN : std::fabs(v * i);
+        if (!temp_path_.empty())
+            temp_values_[0] = plausible_temp(read_scaled(temp_path_, 1000.0));
+    }
+
+private:
+    static double read_scaled(const std::string& path, double div) {
+        const std::string raw = read_file(path);
+        if (raw.empty()) return kNaN;
+        try {
+            return std::stod(raw) / div;
+        } catch (...) {
+            return kNaN;
+        }
+    }
+    static std::string realpath_of(const std::string& p) {
+        char buf[PATH_MAX];
+        const char* r = realpath(p.c_str(), buf);
+        return r ? std::string(r) : std::string();
+    }
+
+    std::string name_ = "POWER-Z";
+    std::string volt_path_, curr_path_, temp_path_;
+};
+
 #if MB_HAVE_FTDI
 // ---------------------------------------------------------------------------
 // INA228 external power meter over an FT232H USB->I2C bridge (libftdi1 MPSSE).
@@ -1140,9 +1248,15 @@ void Probes::discover(std::vector<std::string>* notes) {
                 } else {
                     const size_t nt = p->temp_metrics().size();
                     const size_t np = p->power_metrics().size();
+                    // The system families count too, or an inline supply meter
+                    // reports as "1 temp sensor(s)" and looks half-detected.
+                    const size_t ns = p->sysvoltage_metrics().size() +
+                                      p->syscurrent_metrics().size() +
+                                      p->syspower_metrics().size();
                     std::vector<std::string> parts;
                     if (nt) parts.push_back(std::to_string(nt) + " temp");
                     if (np) parts.push_back(std::to_string(np) + " power");
+                    if (ns) parts.push_back(std::to_string(ns) + " system");
                     if (parts.empty()) parts.push_back("0");
                     for (size_t i = 0; i < parts.size(); ++i)
                         msg += (i ? " + " : "") + parts[i];
@@ -1187,6 +1301,13 @@ void Probes::discover(std::vector<std::string>* notes) {
     }
     {
         auto p = std::make_unique<BoardThermalProbe>();
+        bool ok = p->discover();
+        try_add(std::move(p), ok);
+    }
+    {
+        // Before the INA228 bridges: both are external USB meters, and this
+        // keeps the board-level rows ahead of the per-rail ones.
+        auto p = std::make_unique<PowerZProbe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }
@@ -1265,6 +1386,9 @@ void Probes::flatten() {
     charge_metrics_.clear();
     voltage_metrics_.clear();
     current_metrics_.clear();
+    sysvoltage_metrics_.clear();
+    syscurrent_metrics_.clear();
+    syspower_metrics_.clear();
     auto stamp = [](MetricInfo& m, size_t k, DeviceProbe* d) {
         m.device = static_cast<int>(k);
         m.device_name = d->name();
@@ -1304,6 +1428,9 @@ void Probes::flatten() {
     emit(&DeviceProbe::charge_metrics, " CHARGE", charge_metrics_);
     emit(&DeviceProbe::voltage_metrics, " VBUS", voltage_metrics_);
     emit(&DeviceProbe::current_metrics, " CURRENT", current_metrics_);
+    emit(&DeviceProbe::sysvoltage_metrics, " SYS VBUS", sysvoltage_metrics_);
+    emit(&DeviceProbe::syscurrent_metrics, " SYS CURRENT", syscurrent_metrics_);
+    emit(&DeviceProbe::syspower_metrics, " SYS POWER", syspower_metrics_);
 
     temp_values_.assign(temp_metrics_.size(), kNaN);
     power_values_.assign(power_metrics_.size(), kNaN);
@@ -1311,6 +1438,9 @@ void Probes::flatten() {
     charge_values_.assign(charge_metrics_.size(), kNaN);
     voltage_values_.assign(voltage_metrics_.size(), kNaN);
     current_values_.assign(current_metrics_.size(), kNaN);
+    sysvoltage_values_.assign(sysvoltage_metrics_.size(), kNaN);
+    syscurrent_values_.assign(syscurrent_metrics_.size(), kNaN);
+    syspower_values_.assign(syspower_metrics_.size(), kNaN);
 }
 
 void Probes::poll() {
@@ -1330,4 +1460,7 @@ void Probes::poll() {
     fill(&DeviceProbe::charge_values, charge_values_);
     fill(&DeviceProbe::voltage_values, voltage_values_);
     fill(&DeviceProbe::current_values, current_values_);
+    fill(&DeviceProbe::sysvoltage_values, sysvoltage_values_);
+    fill(&DeviceProbe::syscurrent_values, syscurrent_values_);
+    fill(&DeviceProbe::syspower_values, syspower_values_);
 }

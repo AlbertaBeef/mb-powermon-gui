@@ -69,6 +69,18 @@ public:
     // voltage: one unit per graph, and it must never join power_.
     const std::vector<MetricInfo>& current_metrics() const { return current_metrics_; }
     const std::vector<double>& current_values() const { return current_values_; }
+    // Whole-system voltage / current / power from an inline supply meter (the
+    // POWER-Z KM003C on the IQ-9075's USB-C input). Deliberately NOT part of
+    // voltage_ / current_ / power_, which are the *accelerator* rails: same
+    // units, different subject. A 19.9 V board input on the same axis as a
+    // 3.3 V card rail flattens the sag that graph exists to show, and 22 W of
+    // board draw does the same to a card's 0.85 W.
+    const std::vector<MetricInfo>& sysvoltage_metrics() const { return sysvoltage_metrics_; }
+    const std::vector<double>& sysvoltage_values() const { return sysvoltage_values_; }
+    const std::vector<MetricInfo>& syscurrent_metrics() const { return syscurrent_metrics_; }
+    const std::vector<double>& syscurrent_values() const { return syscurrent_values_; }
+    const std::vector<MetricInfo>& syspower_metrics() const { return syspower_metrics_; }
+    const std::vector<double>& syspower_values() const { return syspower_values_; }
 
 protected:
     std::vector<MetricInfo> temp_metrics_;
@@ -83,6 +95,9 @@ protected:
     std::vector<double> voltage_values_;
     std::vector<MetricInfo> current_metrics_;
     std::vector<double> current_values_;
+    std::vector<MetricInfo> sysvoltage_metrics_, syscurrent_metrics_,
+        syspower_metrics_;
+    std::vector<double> sysvoltage_values_, syscurrent_values_, syspower_values_;
     std::string bdf_;
     std::string note_;
     std::string color_alias_;
@@ -114,6 +129,13 @@ public:
     // Current (A), alias-ordered like power. Empty with no shunts.
     const std::vector<MetricInfo>& current_metrics() const { return current_metrics_; }
     const std::vector<double>& current_values() const { return current_values_; }
+    // Inline supply meter, whole board; see DeviceProbe.
+    const std::vector<MetricInfo>& sysvoltage_metrics() const { return sysvoltage_metrics_; }
+    const std::vector<double>& sysvoltage_values() const { return sysvoltage_values_; }
+    const std::vector<MetricInfo>& syscurrent_metrics() const { return syscurrent_metrics_; }
+    const std::vector<double>& syscurrent_values() const { return syscurrent_values_; }
+    const std::vector<MetricInfo>& syspower_metrics() const { return syspower_metrics_; }
+    const std::vector<double>& syspower_values() const { return syspower_values_; }
 
     int device_count() const { return static_cast<int>(devices_.size()); }
 
@@ -131,6 +153,9 @@ private:
     std::vector<std::unique_ptr<DeviceProbe>> devices_;
     std::vector<MetricInfo> temp_metrics_, power_metrics_;
     std::vector<double> temp_values_, power_values_;
+    std::vector<MetricInfo> sysvoltage_metrics_, syscurrent_metrics_,
+        syspower_metrics_;
+    std::vector<double> sysvoltage_values_, syscurrent_values_, syspower_values_;
     std::vector<MetricInfo> energy_metrics_, charge_metrics_, voltage_metrics_,
         current_metrics_;
     std::vector<double> energy_values_, charge_values_, voltage_values_,

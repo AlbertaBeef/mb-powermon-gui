@@ -148,9 +148,54 @@ MainWindow::MainWindow() {
     // rising and voltage falling before power is the result. Both collapsed by
     // default: on a healthy supply they are flat lines, and only interesting
     // when they are not.
+    // The System triplet leads, and reads voltage -> current -> power like the
+    // Accelerator one below it: the meter measures V and I and derives W, so a
+    // sagging supply reads top-to-bottom. Board total first, then the per-rail
+    // breakdown inside it. Deliberately separate graphs, not extra series:
+    // 19.9 V of board input beside a 3.3 V card rail, or 22 W of board draw
+    // beside a card's 0.85 W, flattens the trace that matters.
+    if (!probes_.sysvoltage_metrics().empty()) {
+        root->append(make_section(
+            "System Voltage",
+            build_metric_section(probes_.sysvoltage_metrics(),
+                                 colors_for(probes_.sysvoltage_metrics()),
+                                 /*percent_temp_axis=*/false, fmt_volts,
+                                 sysvbus_graph_, sysvbus_values_,
+                                 "No inline supply meter found.",
+                                 &sysvbus_min_labels_,
+                                 /*min_axis_max=*/20.0),
+            /*expanded=*/false));
+    }
+
+    if (!probes_.syscurrent_metrics().empty()) {
+        root->append(make_section(
+            "System Current",
+            build_metric_section(probes_.syscurrent_metrics(),
+                                 colors_for(probes_.syscurrent_metrics()),
+                                 /*percent_temp_axis=*/false, fmt_amps,
+                                 syscurr_graph_, syscurr_values_,
+                                 "No inline supply meter found.",
+                                 &syscurr_absmax_labels_,
+                                 /*min_axis_max=*/2.0),
+            /*expanded=*/false));
+    }
+
+    if (!probes_.syspower_metrics().empty()) {
+        root->append(make_section(
+            "System Power",
+            build_metric_section(probes_.syspower_metrics(),
+                                 colors_for(probes_.syspower_metrics()),
+                                 /*percent_temp_axis=*/false, fmt_power,
+                                 syspower_graph_, syspower_values_,
+                                 "No inline supply meter found.",
+                                 &syspower_max_labels_,
+                                 /*min_axis_max=*/10.0),
+            /*expanded=*/true));
+    }
+
     if (!probes_.voltage_metrics().empty()) {
         root->append(make_section(
-            "Bus Voltage",
+            "Accelerator Voltage",
             build_metric_section(probes_.voltage_metrics(),
                                  colors_for(probes_.voltage_metrics()),
                                  /*percent_temp_axis=*/false, fmt_volts,
@@ -168,7 +213,7 @@ MainWindow::MainWindow() {
     // rather than being silently absorbed.
     if (!probes_.current_metrics().empty()) {
         root->append(make_section(
-            "Current",
+            "Accelerator Current",
             build_metric_section(probes_.current_metrics(),
                                  colors_for(probes_.current_metrics()),
                                  /*percent_temp_axis=*/false, fmt_amps,
@@ -180,7 +225,7 @@ MainWindow::MainWindow() {
     }
 
     root->append(make_section(
-        "Power",
+        "Accelerator Power",
         build_metric_section(probes_.power_metrics(),
                              colors_for(probes_.power_metrics()),
                              /*percent_temp_axis=*/false, fmt_power, power_graph_,
@@ -436,6 +481,57 @@ bool MainWindow::on_tick() {
                 if (!std::isnan(jv[k])) { sum += jv[k]; ++cnt; }
             }
             a.label->set_text(cnt ? "total " + fmt_joules(sum) : "total —");
+        }
+    }
+
+    // System rails from the inline supply meter. Same aggregate choices as the
+    // accelerator ones below: min for voltage (a brown-out is the lowest
+    // excursion), peak-by-magnitude for current, max for power.
+    const auto& svv = probes_.sysvoltage_values();
+    if (sysvbus_graph_ && !svv.empty() &&
+        static_cast<int>(svv.size()) == sysvbus_graph_->series_count()) {
+        sysvbus_graph_->push(svv);
+        for (size_t i = 0; i < sysvbus_values_.size() && i < svv.size(); ++i)
+            sysvbus_values_[i]->set_text(fmt_volts(svv[i]));
+        for (const auto& a : sysvbus_min_labels_) {
+            double lo = std::numeric_limits<double>::infinity();
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(svv.size()); ++k)
+                if (!std::isnan(svv[k]) && svv[k] < lo) lo = svv[k];
+            a.label->set_text(std::isinf(lo) ? "min —" : "min " + fmt_volts(lo));
+        }
+    }
+
+    const auto& scv = probes_.syscurrent_values();
+    if (syscurr_graph_ && !scv.empty() &&
+        static_cast<int>(scv.size()) == syscurr_graph_->series_count()) {
+        syscurr_graph_->push(scv);
+        for (size_t i = 0; i < syscurr_values_.size() && i < scv.size(); ++i)
+            syscurr_values_[i]->set_text(fmt_amps(scv[i]));
+        for (const auto& a : syscurr_absmax_labels_) {
+            double peak = 0.0; bool any = false;
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(scv.size()); ++k) {
+                if (std::isnan(scv[k])) continue;
+                if (!any || std::fabs(scv[k]) > std::fabs(peak)) peak = scv[k];
+                any = true;
+            }
+            a.label->set_text(any ? "peak " + fmt_amps(peak) : "peak —");
+        }
+    }
+
+    const auto& spv = probes_.syspower_values();
+    if (syspower_graph_ && !spv.empty() &&
+        static_cast<int>(spv.size()) == syspower_graph_->series_count()) {
+        syspower_graph_->push(spv);
+        for (size_t i = 0; i < syspower_values_.size() && i < spv.size(); ++i)
+            syspower_values_[i]->set_text(fmt_power(spv[i]));
+        for (const auto& a : syspower_max_labels_) {
+            double hi = -std::numeric_limits<double>::infinity();
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(spv.size()); ++k)
+                if (!std::isnan(spv[k]) && spv[k] > hi) hi = spv[k];
+            a.label->set_text(std::isinf(hi) ? "max —" : "max " + fmt_power(hi));
         }
     }
 
