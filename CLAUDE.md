@@ -23,10 +23,16 @@ Python — no shared code). The TUI still has a **PMD2** meter probe the GUI lac
 Port in either direction as needed — the two have no shared code, so it is a
 reimplementation, not a move.
 
-The UI is deliberately simple: **three sections — Power, Accumulated Energy and
-Temperature** — each a scrolling 10 min time-series graph with a per-device legend
-of live values. Accumulated Energy is collapsed by default and only exists when
-INA228 shunts are present; over a 10-minute window a monotonic accumulator draws a
+The UI is deliberately simple: **five sections — Bus Voltage, Current, Power,
+Accumulated Energy and Temperature** — each a scrolling 10 min time-series graph
+with a per-device legend of live values.
+
+**Voltage and Current come before Power on purpose.** The INA228 *measures* VBUS
+and the shunt drop and *derives* POWER as their product, so in this order a
+sagging rail reads top-to-bottom: current rises, voltage falls, power is what
+results. Both are collapsed by default — on a healthy supply they are flat lines
+— and both exist only when INA228 shunts are present, as does Accumulated
+Energy; over a 10-minute window a monotonic accumulator draws a
 near-straight line whose *slope* is the average power the graph above already
 shows, so its worth is the absolute total on the legend. Each
 legend row also shows a **per-device summary** between the device name and its
@@ -35,6 +41,21 @@ the max of its readings (`max 0.93 W`). It does **not** show
 CPU/Memory/Network/Disk — an earlier iteration did (styled exactly like System
 Monitor's resource graphs) but that was scrapped; if you find any reference to
 `Sampler`, `Gauge`, or CPU/Mem panels, it's stale.
+
+**Rail polarity is a config flag, not a code constant.** All four shunt breakouts
+on the reference rig are wired IN+/IN- reversed, and the INA228 reports the shunt
+drop *signed*, so `CURRENT` and `CHARGE` read negative for a card that is
+drawing. `ina228.conf` takes a per-rail `invert` flag — `<port> = <label>,
+invert` — applied in `INA228Probe::poll()` to those two families only. `VBUS`,
+`POWER` and `ENERGY` come from unsigned registers and cannot carry a polarity
+error, so inverting them would be wrong rather than merely redundant. Per-rail
+because the harness can be corrected one breakout at a time.
+
+**The bus-undervoltage latch is armed but not yet surfaced here.** `BUVL` is set
+to 3.00 V with `ALATCH`, and a trip is detected in `poll()` — but this app has no
+Logger and reads `note()` only at discovery, so the event currently goes nowhere.
+mb-benchmark-gui pipes it to its CSV. Surfacing it in the Bus Voltage legend is
+the obvious next step; until then the detection is live and the reporting is not.
 
 The window title is **"NPU Power and Temperature Monitoring GUI"**.
 

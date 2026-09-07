@@ -76,4 +76,10 @@ private:
     GraphArea* accum_graph_ = nullptr;
     std::vector<Gtk::Label*> accum_values_;
     std::vector<AggEntry> accum_sum_labels_;
+    GraphArea* vbus_graph_ = nullptr;
+    std::vector<Gtk::Label*> vbus_values_;
+    std::vector<AggEntry> vbus_min_labels_;
+    GraphArea* curr_graph_ = nullptr;
+    std::vector<Gtk::Label*> curr_values_;
+    std::vector<AggEntry> curr_absmax_labels_;
 };

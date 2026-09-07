@@ -38,7 +38,7 @@ on-die `POW` and the shunt `INA228` reading, and the summary reports the larger.
 | **Axelera Metis** | `SYS` / `AI0`–`AI3` via `triton_trace --peek` | — (not exposed on M.2) | ✅ |
 | **Qualcomm IQ** (IQ-9075 / QCS9075) | `N0-0`–`N1-2` via the `nsp-*-thermal` sysfs zones | — (**no** power measurement exists on the board) | ✅ |
 | **IQ9075 Board** (ambient) | `AMB` via a TI TMP411 on i2c-19 0x4c (hwmon `temp1_input`) | — | ✅ |
-| **INA228** (external) | `INA228 TEMP` — the monitor's own die, i.e. ambient plus shunt self-heating, **not** the card's die | `INA228 POWER` (W) on an FT232H USB→I²C bridge (libftdi1 MPSSE), one probe per bridge, plus `INA228 ENERGY` (J) and `INA228 CHARGE` (C) from the chip's 40-bit hardware accumulators | ✅ (measures the rail, never touches the NPU) |
+| **INA228** (external) | `INA228 TEMP` — the monitor's own die, i.e. ambient plus shunt self-heating, **not** the card's die | `INA228 POWER` (W) on an FT232H USB→I²C bridge (libftdi1 MPSSE), one probe per bridge, plus `INA228 VBUS` (V), `INA228 CURRENT` (A), and `INA228 ENERGY` (J) / `INA228 CHARGE` (C) from the chip's 40-bit hardware accumulators | ✅ (measures the rail, never touches the NPU) |
 
 Devices are auto-discovered at startup; only what's present appears. Whatever a
 card doesn't expose simply doesn't get a trace. One exception: a Metis whose

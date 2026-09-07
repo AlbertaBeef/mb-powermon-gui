@@ -38,6 +38,20 @@ std::string fmt_power(double v) {
     return b;
 }
 // Joules. Accumulates without bound over a session, so no fixed width.
+// Volts. Three decimals on purpose: the question this graph answers is a
+// ~200 mV sag on a 3.3 V rail, and %.1f would quantise that away entirely.
+// Amps, signed. Three decimals: the interesting range is 0.5-4 A and the
+// question is a few hundred mA of delta.
+std::string fmt_amps(double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%+.3f", v);
+    return b;
+}
+std::string fmt_volts(double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.3f", v);
+    return b;
+}
 std::string fmt_joules(double v) {
     char b[32];
     std::snprintf(b, sizeof b, "%.1f", v);
@@ -128,27 +142,54 @@ MainWindow::MainWindow() {
     root->set_margin(12);
     set_child(*root);
 
+    // Voltage and Current lead deliberately: they are the independent
+    // measurements — the INA228 measures VBUS and the shunt drop and derives
+    // POWER as their product — so a sagging rail reads top-to-bottom, current
+    // rising and voltage falling before power is the result. Both collapsed by
+    // default: on a healthy supply they are flat lines, and only interesting
+    // when they are not.
+    if (!probes_.voltage_metrics().empty()) {
+        root->append(make_section(
+            "Bus Voltage",
+            build_metric_section(probes_.voltage_metrics(),
+                                 colors_for(probes_.voltage_metrics()),
+                                 /*percent_temp_axis=*/false, fmt_volts,
+                                 vbus_graph_, vbus_values_,
+                                 "No INA228 shunts, so no rail voltage.",
+                                 &vbus_min_labels_,
+                                 // 3.4 floor keeps a nominal 3.3 V rail off the
+                                 // top edge without flattening the sag.
+                                 /*min_axis_max=*/3.4),
+            /*expanded=*/false));
+    }
+
+    // Reads NEGATIVE on this rig — IN+/IN- are wired the other way round — and
+    // is shown as measured rather than abs()'d, so a later rewire stays visible
+    // rather than being silently absorbed.
+    if (!probes_.current_metrics().empty()) {
+        root->append(make_section(
+            "Current",
+            build_metric_section(probes_.current_metrics(),
+                                 colors_for(probes_.current_metrics()),
+                                 /*percent_temp_axis=*/false, fmt_amps,
+                                 curr_graph_, curr_values_,
+                                 "No INA228 shunts, so no rail current.",
+                                 &curr_absmax_labels_,
+                                 /*min_axis_max=*/1.0),
+            /*expanded=*/false));
+    }
+
     root->append(make_section(
         "Power",
         build_metric_section(probes_.power_metrics(),
                              colors_for(probes_.power_metrics()),
                              /*percent_temp_axis=*/false, fmt_power, power_graph_,
                              power_values_,
-                             "No power source available. On the M.2 cards power "
-                             "comes only from the Hailo firmware session or the "
-                             "MemryX SDK; SoC-integrated NPUs (Qualcomm IQ) have "
-                             "no current sensing at all. Otherwise it takes an "
-                             "external meter (INA228 / PMD2).",
+                             "No power source available — an INA228 shunt or a "
+                             "vendor SDK session is needed for watts.",
                              &power_max_labels_)));
 
-    // Accumulated energy sits with Power because it is its integral. Built only
-    // when there are shunts: on a host with no libftdi the family is empty and
-    // this would be a zero-series graph.
-    //
-    // Collapsed by default. Over the graph's window a monotonic accumulator is
-    // a near-straight line whose slope is the average power — which the graph
-    // directly above already shows. Its worth is the absolute total, read off
-    // the legend.
+    // Accumulated energy sits with Power because it is its integral.
     if (!probes_.energy_metrics().empty()) {
         root->append(make_section(
             "Accumulated Energy",
@@ -395,6 +436,46 @@ bool MainWindow::on_tick() {
                 if (!std::isnan(jv[k])) { sum += jv[k]; ++cnt; }
             }
             a.label->set_text(cnt ? "total " + fmt_joules(sum) : "total —");
+        }
+    }
+
+    // Bus voltage. The row aggregate is the MINIMUM, not power's max or
+    // temperature's mean: a supply problem shows up as the lowest excursion,
+    // and averaging it away is exactly how a brown-out stays invisible.
+    const auto& uv = probes_.voltage_values();
+    if (vbus_graph_ && !uv.empty() &&
+        static_cast<int>(uv.size()) == vbus_graph_->series_count()) {
+        vbus_graph_->push(uv);
+        for (size_t i = 0; i < vbus_values_.size() && i < uv.size(); ++i)
+            vbus_values_[i]->set_text(fmt_volts(uv[i]));
+        for (const auto& a : vbus_min_labels_) {
+            double lo = std::numeric_limits<double>::infinity();
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(uv.size()); ++k) {
+                if (!std::isnan(uv[k]) && uv[k] < lo) lo = uv[k];
+            }
+            a.label->set_text(std::isinf(lo) ? "min —" : "min " + fmt_volts(lo));
+        }
+    }
+
+    // Current. The row aggregate is the PEAK BY MAGNITUDE, shown with its sign:
+    // draw reads negative on this rig, so a plain max would report the quietest
+    // moment and a plain min would be right only by accident of the wiring.
+    const auto& av = probes_.current_values();
+    if (curr_graph_ && !av.empty() &&
+        static_cast<int>(av.size()) == curr_graph_->series_count()) {
+        curr_graph_->push(av);
+        for (size_t i = 0; i < curr_values_.size() && i < av.size(); ++i)
+            curr_values_[i]->set_text(fmt_amps(av[i]));
+        for (const auto& a : curr_absmax_labels_) {
+            double peak = 0.0; bool any = false;
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(av.size()); ++k) {
+                if (std::isnan(av[k])) continue;
+                if (!any || std::fabs(av[k]) > std::fabs(peak)) peak = av[k];
+                any = true;
+            }
+            a.label->set_text(any ? "peak " + fmt_amps(peak) : "peak —");
         }
     }
 

@@ -59,6 +59,16 @@ public:
     const std::vector<double>& energy_values() const { return energy_values_; }
     const std::vector<MetricInfo>& charge_metrics() const { return charge_metrics_; }
     const std::vector<double>& charge_values() const { return charge_values_; }
+    // Bus voltage (V) at the shunt. Only the INA228s have it. Its own family
+    // because a GraphArea carries one unit, and because it must never join
+    // power_: anything reading the max of that family as watts would see a
+    // 3.3 and report it as power the card is not drawing.
+    const std::vector<MetricInfo>& voltage_metrics() const { return voltage_metrics_; }
+    const std::vector<double>& voltage_values() const { return voltage_values_; }
+    // Current (A) through the shunt. Its own family for the same reason as
+    // voltage: one unit per graph, and it must never join power_.
+    const std::vector<MetricInfo>& current_metrics() const { return current_metrics_; }
+    const std::vector<double>& current_values() const { return current_values_; }
 
 protected:
     std::vector<MetricInfo> temp_metrics_;
@@ -69,6 +79,10 @@ protected:
     std::vector<double> energy_values_;
     std::vector<MetricInfo> charge_metrics_;
     std::vector<double> charge_values_;
+    std::vector<MetricInfo> voltage_metrics_;
+    std::vector<double> voltage_values_;
+    std::vector<MetricInfo> current_metrics_;
+    std::vector<double> current_values_;
     std::string bdf_;
     std::string note_;
     std::string color_alias_;
@@ -94,6 +108,12 @@ public:
     const std::vector<double>& energy_values() const { return energy_values_; }
     const std::vector<MetricInfo>& charge_metrics() const { return charge_metrics_; }
     const std::vector<double>& charge_values() const { return charge_values_; }
+    // Bus voltage (V), alias-ordered like power. Empty with no shunts.
+    const std::vector<MetricInfo>& voltage_metrics() const { return voltage_metrics_; }
+    const std::vector<double>& voltage_values() const { return voltage_values_; }
+    // Current (A), alias-ordered like power. Empty with no shunts.
+    const std::vector<MetricInfo>& current_metrics() const { return current_metrics_; }
+    const std::vector<double>& current_values() const { return current_values_; }
 
     int device_count() const { return static_cast<int>(devices_.size()); }
 
@@ -111,8 +131,10 @@ private:
     std::vector<std::unique_ptr<DeviceProbe>> devices_;
     std::vector<MetricInfo> temp_metrics_, power_metrics_;
     std::vector<double> temp_values_, power_values_;
-    std::vector<MetricInfo> energy_metrics_, charge_metrics_;
-    std::vector<double> energy_values_, charge_values_;
+    std::vector<MetricInfo> energy_metrics_, charge_metrics_, voltage_metrics_,
+        current_metrics_;
+    std::vector<double> energy_values_, charge_values_, voltage_values_,
+        current_values_;
     // devices_ indices, emission order for every folded family.
     std::vector<size_t> dev_order_;
 };

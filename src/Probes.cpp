@@ -788,8 +788,22 @@ struct Ina228 {
     enum Reg : uint8_t {
         CONFIG = 0x00, ADC_CONFIG = 0x01, SHUNT_CAL = 0x02,
         VBUS = 0x05, DIETEMP = 0x06, CURRENT = 0x07, POWER = 0x08,
-        ENERGY = 0x09, CHARGE = 0x0A, DEVICE_ID = 0x3F,
+        ENERGY = 0x09, CHARGE = 0x0A, DIAG_ALRT = 0x0B, BUVL = 0x0F,
+        DEVICE_ID = 0x3F,
     };
+    // DIAG_ALRT bit 15 latches a trip until the register is read; bit 3 is the
+    // bus under-limit flag. Verified on hardware 2026-09-07: with BUVL set above
+    // the live rail the flag sets, below it clears, and a read clears the latch.
+    // That read-to-clear is the point — polled once a second it reports whether
+    // the rail dipped AT ANY POINT in that second, catching transients far
+    // shorter than we could sample directly. Note ADC_CONFIG averages 64
+    // conversions (~67 ms), and the comparator sees that average, so a dip much
+    // shorter than that is still smoothed away before it can be detected.
+    static constexpr uint16_t kAlatch = 0x8000;
+    static constexpr uint16_t kBusUnderLimit = 1u << 3;
+    // BUVL is unsigned, 3.125 mV/LSB — 16x the VBUS LSB, i.e. it compares
+    // against the top 16 bits of the 20-bit VBUS result. Measured, not assumed.
+    static constexpr double kBuvlLsbV = 3.125e-3;
     // CONFIG bit 14. Writing it clears ENERGY and CHARGE; it is an ordinary R/W
     // bit, so it has to be written back to 0 or the accumulators stay pinned.
     static constexpr uint16_t kRstAcc = 0x4000;
@@ -831,10 +845,41 @@ struct Ina228 {
         // second client reading these accumulators would see them cleared. Kept
         // because nothing else on either host touches them, and a series that
         // began at an arbitrary carried-over value would be unreadable.
-        return write_reg16(CONFIG, kRstAcc) && write_reg16(CONFIG, 0x0000) &&
-               write_reg16(ADC_CONFIG, adc) && write_reg16(SHUNT_CAL, cal);
+        if (!(write_reg16(CONFIG, kRstAcc) && write_reg16(CONFIG, 0x0000) &&
+              write_reg16(ADC_CONFIG, adc) && write_reg16(SHUNT_CAL, cal)))
+            return false;
+        // Arm the latched bus-undervoltage detector. The threshold is the M.2
+        // 3.3 V rail's own lower limit (3.3 V -9% = 3.003 V), so a trip means
+        // the supply left spec, not merely that it sagged. Like RSTACC this is
+        // device state another client would see; it drives only the ALERT pin
+        // (unwired here) and the status flag, never the conversions.
+        undervolt_limit_v = 3.0;
+        return write_reg16(BUVL, (uint16_t)(undervolt_limit_v / kBuvlLsbV + 0.5)) &&
+               write_reg16(DIAG_ALRT, kAlatch);
     }
     double power(bool* ok) { return read24(POWER, ok) * 3.2 * current_lsb; }  // W
+    // Bus voltage. 24-bit register, 20-bit result in bits 23:4, 195.3125 uV/LSB.
+    double bus_voltage(bool* ok) { return read24_raw20(VBUS, ok) * 195.3125e-6; }
+    // Current. Same 20-in-24 layout as VBUS but SIGNED, so read24_raw20() is the
+    // wrong helper on its own — unsigned it would report ~1.05 MA instead of
+    // -3.9 A. Sign-extend from bit 19, the same way charge() does from bit 39.
+    //
+    // Reads NEGATIVE on every rail here, and that is the harness, not a fault:
+    // IN+/IN- are wired the other way round, which is also why CHARGE is
+    // negative while POWER and ENERGY (unsigned registers) are not. Reported as
+    // measured rather than abs()'d — the sign is a real fact about the wiring,
+    // and hiding it would mask a later rewire.
+    double current(bool* ok) {
+        uint32_t raw = read24_raw20(CURRENT, ok);
+        if (raw & (1u << 19)) raw |= ~((1u << 20) - 1);
+        return (double)(int32_t)raw * current_lsb;  // A
+    }
+    // True if the rail went below BUVL at any point since the last call. Reading
+    // DIAG_ALRT clears the latch, so this is edge-triggered per poll.
+    bool undervoltage(bool* ok) {
+        return (read16(DIAG_ALRT, ok) & kBusUnderLimit) != 0;
+    }
+    double undervolt_limit_v = 0.0;
     // Monitor die temperature: signed 16-bit, 7.8125 m°C/LSB. A *full* 16-bit
     // register, so read24_raw20() is the wrong helper — and read16() is
     // unsigned, hence the cast.
@@ -884,9 +929,22 @@ inline std::vector<Loc> enumerate_bridges() {
 // Optional user map: USB port-path → legend label (which accelerator's rail this
 // INA228 measures). File: $MB_INA228_CONFIG, else
 // $XDG_CONFIG_HOME/mb-powermon-gui/ina228.conf, else ~/.config/…. Lines are
-// "<port> = <label>", '#' starts a comment. Missing file → empty map (probes
-// fall back to "INA228#<n>").
-inline std::map<std::string, std::string> load_label_map() {
+// "<port> = <label>[, <flag>...]", '#' starts a comment. Missing file → empty
+// map (probes fall back to "INA228#<n>").
+//
+// The one flag today is `invert`, which negates CURRENT and CHARGE for that
+// rail. It exists because IN+/IN- can be wired either way round on the shunt
+// breakout, and the INA228 reports the shunt drop signed: reversed leads give a
+// negative current for a card that is drawing. VBUS, POWER and ENERGY are
+// unsigned registers and are unaffected, which is why only two families move.
+//
+// Deliberately per-rail, not global: the harness can be corrected one breakout
+// at a time, and a global switch would then be wrong for every other rail.
+struct RailSpec {
+    std::string label;
+    bool invert = false;
+};
+inline std::map<std::string, RailSpec> load_label_map() {
     std::string path;
     if (const char* e = std::getenv("MB_INA228_CONFIG")) {
         path = e;
@@ -896,7 +954,7 @@ inline std::map<std::string, std::string> load_label_map() {
         else if (const char* h = std::getenv("HOME")) base = std::string(h) + "/.config";
         if (!base.empty()) path = base + "/mb-powermon-gui/ina228.conf";
     }
-    std::map<std::string, std::string> m;
+    std::map<std::string, RailSpec> m;
     if (path.empty()) return m;
     std::ifstream f(path);
     if (!f) return m;
@@ -912,7 +970,23 @@ inline std::map<std::string, std::string> load_label_map() {
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = trim(line.substr(0, eq)), val = trim(line.substr(eq + 1));
-        if (!key.empty() && !val.empty()) m[key] = val;
+        if (key.empty() || val.empty()) continue;
+        RailSpec spec;
+        // "<label>[, flag[, flag...]]" — unknown flags are ignored rather than
+        // fatal, so an older binary reading a newer config still maps the rail.
+        std::size_t start = 0;
+        for (int field = 0;; ++field) {
+            const std::size_t comma = val.find(',', start);
+            std::string tok = trim(val.substr(
+                start, comma == std::string::npos ? comma : comma - start));
+            std::string low = tok;
+            for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+            if (field == 0) spec.label = tok;
+            else if (low == "invert") spec.invert = true;
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        if (!spec.label.empty()) m[key] = spec;
     }
     return m;
 }
@@ -926,8 +1000,9 @@ public:
     // rail this INA228 measures; the legend row reads "INA228 - <label>" so the
     // sensor is always identifiable. Unmapped bridges fall back to "INA228#<n>".
     INA228Probe(int usb_bus, int usb_addr, std::string port, std::string label,
-                int index)
-        : usb_bus_(usb_bus), usb_addr_(usb_addr), port_(std::move(port)) {
+                int index, bool invert = false)
+        : usb_bus_(usb_bus), usb_addr_(usb_addr), port_(std::move(port)),
+          invert_(invert) {
         name_ = label.empty() ? "INA228#" + std::to_string(index)
                               : "INA228 - " + label;
         color_alias_ = label;  // share the mapped accelerator's swatch, if present
@@ -960,13 +1035,17 @@ public:
             energy_values_.push_back(kNaN);
             charge_metrics_.push_back({name_ + " CHARGE", "C"});
             charge_values_.push_back(kNaN);
+            voltage_metrics_.push_back({name_ + " VBUS", "V"});
+            voltage_values_.push_back(kNaN);
+            current_metrics_.push_back({name_ + " CURRENT", "A"});
+            current_values_.push_back(kNaN);
         }
         if (sensors_.empty()) {
             note_ = "FT232H present but no INA228 responded";
             return false;
         }
         // If a bridge carries more than one sensor, disambiguate by I2C address.
-        // Every family is indexed by the same sensor index, so all four have to
+        // Every family is indexed by the same sensor index, so all six have to
         // be relabelled together or they desynchronise.
         if (sensors_.size() > 1)
             for (size_t i = 0; i < sensors_.size(); ++i) {
@@ -980,6 +1059,8 @@ public:
                 temp_metrics_[i].label = tag("TEMP");
                 energy_metrics_[i].label = tag("ENERGY");
                 charge_metrics_[i].label = tag("CHARGE");
+                voltage_metrics_[i].label = tag("VBUS");
+                current_metrics_[i].label = tag("CURRENT");
             }
         bdf_ = "usb " + port_;  // stable physical-port locator (e.g. "usb 1-1")
         std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle
@@ -1003,7 +1084,35 @@ public:
             energy_values_[i] = ok ? j : kNaN;
             ok = false;
             const double c = sensors_[i].charge(&ok);
-            charge_values_[i] = ok ? c : kNaN;
+            // `invert` from ina228.conf, applied to the two SIGNED families only.
+            // VBUS/POWER/ENERGY come from unsigned registers and cannot carry a
+            // polarity error, so flipping them would be wrong, not merely
+            // unnecessary.
+            charge_values_[i] = ok ? (invert_ ? -c : c) : kNaN;
+            ok = false;
+            const double v = sensors_[i].bus_voltage(&ok);
+            voltage_values_[i] = ok ? v : kNaN;
+            ok = false;
+            const double a = sensors_[i].current(&ok);
+            current_values_[i] = ok ? (invert_ ? -a : a) : kNaN;
+            // Latched bus-undervoltage. Reading DIAG_ALRT clears the latch, so
+            // this answers "did the rail leave spec at any point in the last
+            // second?" rather than "is it out of spec right now" — the only way
+            // a 1 Hz poll can see a transient brown-out. Reported through the
+            // note sink, which logs on transition rather than every second.
+            ok = false;
+            const bool uv = sensors_[i].undervoltage(&ok);
+            if (ok && uv) ++undervolt_count_;
+            if (undervolt_count_ != last_undervolt_count_) {
+                char m[160];
+                std::snprintf(m, sizeof m,
+                              "%s: bus voltage dipped below %.2f V (%d time%s "
+                              "since discovery) — supply may be browning out",
+                              name_.c_str(), sensors_[i].undervolt_limit_v,
+                              undervolt_count_, undervolt_count_ == 1 ? "" : "s");
+                note_ = m;
+                last_undervolt_count_ = undervolt_count_;
+            }
         }
     }
 
@@ -1012,6 +1121,8 @@ private:
     std::string port_, name_;
     std::unique_ptr<ftdi::Ft232hI2c> bus_;
     std::vector<ftdi::Ina228> sensors_;
+    bool invert_ = false;   // ina228.conf `invert` — reversed IN+/IN- on this rail
+    int undervolt_count_ = 0, last_undervolt_count_ = 0;
 };
 #endif  // MB_HAVE_FTDI
 
@@ -1088,9 +1199,11 @@ void Probes::discover(std::vector<std::string>* notes) {
         int idx = 0;
         for (const auto& br : ftdi::enumerate_bridges()) {
             auto it = labels.find(br.port);
-            std::string label = (it != labels.end()) ? it->second : std::string();
+            const std::string label =
+                (it != labels.end()) ? it->second.label : std::string();
+            const bool invert = (it != labels.end()) && it->second.invert;
             auto p = std::make_unique<INA228Probe>(br.bus, br.addr, br.port,
-                                                   label, idx++);
+                                                   label, idx++, invert);
             bool ok = p->discover();
             try_add(std::move(p), ok);
         }
@@ -1150,6 +1263,8 @@ void Probes::flatten() {
     power_metrics_.clear();
     energy_metrics_.clear();
     charge_metrics_.clear();
+    voltage_metrics_.clear();
+    current_metrics_.clear();
     auto stamp = [](MetricInfo& m, size_t k, DeviceProbe* d) {
         m.device = static_cast<int>(k);
         m.device_name = d->name();
@@ -1187,11 +1302,15 @@ void Probes::flatten() {
     emit(&DeviceProbe::power_metrics, " POWER", power_metrics_);
     emit(&DeviceProbe::energy_metrics, " ENERGY", energy_metrics_);
     emit(&DeviceProbe::charge_metrics, " CHARGE", charge_metrics_);
+    emit(&DeviceProbe::voltage_metrics, " VBUS", voltage_metrics_);
+    emit(&DeviceProbe::current_metrics, " CURRENT", current_metrics_);
 
     temp_values_.assign(temp_metrics_.size(), kNaN);
     power_values_.assign(power_metrics_.size(), kNaN);
     energy_values_.assign(energy_metrics_.size(), kNaN);
     charge_values_.assign(charge_metrics_.size(), kNaN);
+    voltage_values_.assign(voltage_metrics_.size(), kNaN);
+    current_values_.assign(current_metrics_.size(), kNaN);
 }
 
 void Probes::poll() {
@@ -1209,4 +1328,6 @@ void Probes::poll() {
     fill(&DeviceProbe::power_values, power_values_);
     fill(&DeviceProbe::energy_values, energy_values_);
     fill(&DeviceProbe::charge_values, charge_values_);
+    fill(&DeviceProbe::voltage_values, voltage_values_);
+    fill(&DeviceProbe::current_values, current_values_);
 }
