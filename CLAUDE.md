@@ -51,6 +51,17 @@ invert` — applied in `INA228Probe::poll()` to those two families only. `VBUS`,
 error, so inverting them would be wrong rather than merely redundant. Per-rail
 because the harness can be corrected one breakout at a time.
 
+**A power reading outside 0…1000 W is a sentinel, not a measurement.**
+`plausible_power()` maps anything outside that band to NaN, at every parse site,
+and the Python telemetry helper gates the same way before the value crosses the
+pipe. An MX3 populated without power telemetry answers `0xFFFFFFFF` mW, which
+this app reported as **4294967.29 W**. It is not merely an ugly graph: a legend
+row's power summary is the **max** across that device's readings and skips NaN
+but *not* a finite huge number, so the sentinel wins and becomes the card's
+reported draw. Shared verbatim with `mb-benchmark-gui`, where the same value also
+fed `power_for_device()` and corrupted every fps/W figure. **A card with no power
+sensor must read NaN, never a number.**
+
 **The bus-undervoltage latch is armed but not yet surfaced here.** `BUVL` is set
 to 3.00 V with `ALATCH`, and a trip is detected in `poll()` — but this app has no
 Logger and reads `note()` only at discovery, so the event currently goes nowhere.

@@ -10,12 +10,26 @@ native desktop window.
 
 ## What it shows
 
-Two sections, each a scrolling 10-minute graph with a per-device legend of live
-values:
+Eight sections, each a scrolling 10-minute graph with a per-device legend of
+live values. Everything except Power and Temperature is collapsed by default:
 
-- **Power** (W) — one trace per power reading, 10 W default axis (auto-expands).
-- **Temperature** (°C) — one trace per on-die sensor, 0–100 °C axis that expands
+- **System Voltage / Current / Power** — the whole board, from an inline
+  ChargerLAB POWER-Z KM003C on the USB-C supply. Present only where that meter
+  is; it is board total, never a card's draw.
+- **Accelerator Voltage (V)** — rail voltage per INA228 shunt.
+- **Accelerator Current (A)** — rail current per shunt, sign-corrected per rail.
+- **Accelerator Power (W)** — one trace per power reading, 10 W default axis
+  (auto-expands).
+- **Accumulated Energy (J)** — joules per rail from the INA228 hardware
+  accumulators, integrated at the ADC rate rather than sampled.
+- **Temperature (°C)** — one trace per on-die sensor, 0–100 °C axis that expands
   if a sensor goes above 100.
+
+**Voltage and Current sit above Power on purpose.** The INA228 *measures* bus
+voltage and the shunt drop and *derives* watts from them, so in this order a
+sagging rail reads top to bottom: current rises, voltage falls, power is what
+results. The two triplets are never merged — 19.9 V of board input on the same
+axis as a 3.3 V card rail flattens the trace the graph exists to show.
 
 Every metric from a given card shares that card's color, kept consistent across
 both graphs, and the legend groups metrics **one device per row** (prefixed with
