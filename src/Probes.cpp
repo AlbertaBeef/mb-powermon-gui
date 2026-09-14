@@ -46,6 +46,33 @@ inline double plausible_temp(double c) {
     return (c >= kTempMinPlausible && c <= kTempMaxPlausible) ? c : kNaN;
 }
 
+// Same idea as plausible_temp, and load-bearing for the same reason: vendor
+// SDKs return an in-band sentinel instead of failing when a reading is not
+// available. A MemryX MX3 without power telemetry answers get_power() with
+// 0xFFFFFFFF mW, which becomes 4294967.295 W.
+//
+// That number is far more damaging than the temperature sentinel, because
+// power_for_device() returns the MAX over a card's power metrics and that value
+// becomes the engine's watts. NaN is skipped by that max, so a real folded
+// INA228 reading still wins — but 4294967.295 is a finite number, so it wins
+// instead and every fps/W and mJ/frame figure for that card is wrong by six
+// orders of magnitude.
+//
+// 0 W is deliberately INSIDE the range: it is a real INA228 overflow signal and
+// a genuine idle reading, so it must pass through as a value, not become a gap.
+// The ceiling is generous on purpose — the largest thing this app legitimately
+// measures is whole-board draw through the POWER-Z, ~25 W — so 1000 W cannot
+// reject a real reading while still catching a 32-bit sentinel.
+//
+// Like plausible_temp: map to NaN, never clamp. A fabricated in-range number
+// sitting next to genuine readings is worse than an empty field.
+constexpr double kPowerMinPlausible = 0.0;
+constexpr double kPowerMaxPlausible = 1000.0;
+
+inline double plausible_power(double w) {
+    return (w >= kPowerMinPlausible && w <= kPowerMaxPlausible) ? w : kNaN;
+}
+
 
 std::string read_file(const std::string& path) {
     std::ifstream f(path);
@@ -159,7 +186,7 @@ public:
             auto p = dev_->get_power_measurement(HAILO_MEASUREMENT_BUFFER_INDEX_0,
                                                  true);
             if (p) {
-                power_values_[0] = p.value().average_value;
+                power_values_[0] = plausible_power(p.value().average_value);
                 power_fail_ = 0;
             } else {
                 power_values_[0] = kNaN;
@@ -305,7 +332,7 @@ public:
         }
         if (power_fd_ >= 0) {
             drain_power_helper();
-            power_values_[0] = last_power_;
+            power_values_[0] = plausible_power(last_power_);
         }
     }
 
@@ -344,7 +371,14 @@ private:
             "except Exception:\n"
             " sys.exit(3)\n"
             "while True:\n"
-            " try: w=mxa.get_power(0)/1000.0\n"
+            // get_power() does not raise on a part without power telemetry —
+            // it returns 0xFFFFFFFF mW, i.e. 4294967.295 W. Gate it here as
+            // well as in plausible_power(), so the sentinel never reaches the
+            // pipe and a reader of the raw helper output is not misled either.
+            // Bound matches kPowerMaxPlausible: 1e6 mW = 1000 W.
+            " try:\n"
+            "  _w=mxa.get_power(0)\n"
+            "  w=(_w/1000.0) if (0<=_w<1e6) else float('nan')\n"
             " except Exception: w=float('nan')\n"
             " sys.stdout.write('%.4f\\n'%w); sys.stdout.flush()\n"
             " time.sleep(1)\n";
@@ -723,7 +757,9 @@ public:
         // Magnitude, matching the INA228 POWER register, which is unsigned by
         // hardware. Draw is unsigned regardless of which way round the meter is
         // installed, so this stays right if someone reverses it.
-        syspower_values_[0] = (std::isnan(v) || std::isnan(i)) ? kNaN : std::fabs(v * i);
+        syspower_values_[0] = (std::isnan(v) || std::isnan(i))
+                                  ? kNaN
+                                  : plausible_power(std::fabs(v * i));
         if (!temp_path_.empty())
             temp_values_[0] = plausible_temp(read_scaled(temp_path_, 1000.0));
     }
@@ -1179,7 +1215,7 @@ public:
         for (size_t i = 0; i < sensors_.size(); ++i) {
             bool ok = false;
             double p = sensors_[i].power(&ok);
-            power_values_[i] = ok ? p : kNaN;
+            power_values_[i] = ok ? plausible_power(p) : kNaN;
             // NaN only on an I2C failure — never 0. Zero is a real reading here
             // (0.0 W is the documented INA228 overflow signal, and a freshly
             // reset accumulator genuinely reads 0 J), so the two must not be
