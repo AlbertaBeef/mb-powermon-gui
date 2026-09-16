@@ -171,6 +171,14 @@ public:
             power_metrics_.push_back({"Hailo POW", "W"});
             power_values_.assign(1, kNaN);
         }
+
+        // The NN core clock lives in the extended device information — not
+        // under any name containing "frequency", which is why a naive grep of
+        // the headers suggests HailoRT exposes no clock at all. It does.
+        if (dev_->get_extended_device_information()) {
+            freq_metrics_.push_back({"Hailo CLK", "MHz"});
+            freq_values_.assign(1, kNaN);
+        }
         return true;
     }
 
@@ -181,6 +189,10 @@ public:
             temp_values_[1] = t.value().ts1_temperature;
         } else {
             temp_values_[0] = temp_values_[1] = kNaN;
+        }
+        if (!freq_values_.empty()) {
+            auto x = dev_->get_extended_device_information();
+            freq_values_[0] = x ? x->neural_network_core_clock_rate / 1e6 : kNaN;
         }
         if (has_power_) {
             auto p = dev_->get_power_measurement(HAILO_MEASUREMENT_BUFFER_INDEX_0,
@@ -238,38 +250,57 @@ public:
             if (std::string(c)[0] != '/' || file_exists(c)) { cli_ = c; break; }
         }
         if (cli_.empty()) cli_ = "dxrt-cli";
-        auto temps = read_temps();
-        if (temps.empty()) return false;
+        Reading r = read_status();
+        if (r.temps.empty()) return false;
         bdf_ = find_pci_bdf_by_vendor(0x1ff4);  // DeepX
-        for (size_t i = 0; i < temps.size(); ++i) {
+        for (size_t i = 0; i < r.temps.size(); ++i) {
             temp_metrics_.push_back({"DeepX T" + std::to_string(i), "°C"});
-            temp_values_.push_back(temps[i]);
+            temp_values_.push_back(r.temps[i]);
+        }
+        for (size_t i = 0; i < r.clocks.size(); ++i) {
+            freq_metrics_.push_back({"DeepX C" + std::to_string(i), "MHz"});
+            freq_values_.push_back(r.clocks[i]);
         }
         return true;
     }
 
     void poll() override {
-        auto temps = read_temps();
+        Reading r = read_status();
         for (size_t i = 0; i < temp_values_.size(); ++i)
-            temp_values_[i] = (i < temps.size()) ? temps[i] : kNaN;
+            temp_values_[i] = (i < r.temps.size()) ? r.temps[i] : kNaN;
+        for (size_t i = 0; i < freq_values_.size(); ++i)
+            freq_values_[i] = (i < r.clocks.size()) ? r.clocks[i] : kNaN;
     }
 
 private:
-    std::vector<double> read_temps() {
+    struct Reading {
+        std::vector<double> temps;
+        std::vector<double> clocks;  // MHz
+    };
+
+    // One `dxrt-cli -s` shell-out yields both, from the same line:
+    //   NPU 0: voltage 750 mV, clock 1000 MHz, temperature 51'C
+    // Parsing them together keeps it to one subprocess per poll.
+    Reading read_status() {
         std::string out = run_capture("timeout 5 " + cli_ + " -s 2>/dev/null");
-        static const std::regex re(
+        static const std::regex re_t(
             R"(NPU\s+(\d+)\s*:.*?temperature\s+([\d.]+)\s*'?\s*C)");
-        std::map<int, double> by_idx;
+        static const std::regex re_c(
+            R"(NPU\s+(\d+)\s*:.*?clock\s+([\d.]+)\s*MHz)");
+        std::map<int, double> t_by_idx, c_by_idx;
         std::istringstream is(out);
         std::string line;
         while (std::getline(is, line)) {
             std::smatch m;
-            if (std::regex_search(line, m, re))
-                by_idx[std::stoi(m[1])] = std::stod(m[2]);
+            if (std::regex_search(line, m, re_t))
+                t_by_idx[std::stoi(m[1])] = std::stod(m[2]);
+            if (std::regex_search(line, m, re_c))
+                c_by_idx[std::stoi(m[1])] = std::stod(m[2]);
         }
-        std::vector<double> v;
-        for (auto& [idx, t] : by_idx) { (void)idx; v.push_back(t); }
-        return v;
+        Reading r;
+        for (auto& [idx, v] : t_by_idx) { (void)idx; r.temps.push_back(v); }
+        for (auto& [idx, v] : c_by_idx) { (void)idx; r.clocks.push_back(v); }
+        return r;
     }
 
     std::string cli_;
@@ -313,6 +344,13 @@ public:
         if (start_power_helper()) {
             power_metrics_.push_back({"MemryX POW", "W"});
             power_values_.assign(1, kNaN);
+            // Same helper, same stream — the clocks ride along for free. One
+            // per chip, matching the per-chip temperature sensors, so a
+            // throttling dip can be read against the die that caused it.
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                freq_metrics_.push_back({"MemryX C" + std::to_string(i), "MHz"});
+                freq_values_.push_back(kNaN);
+            }
         }
 
         poll();
@@ -333,6 +371,8 @@ public:
         if (power_fd_ >= 0) {
             drain_power_helper();
             power_values_[0] = plausible_power(last_power_);
+            for (size_t i = 0; i < freq_values_.size(); ++i)
+                freq_values_[i] = i < last_freqs_.size() ? last_freqs_[i] : kNaN;
         }
     }
 
@@ -370,6 +410,11 @@ private:
             " from memryx import mxa\n"
             "except Exception:\n"
             " sys.exit(3)\n"
+            // Chip count gates the clock loop: the SDK does NOT bounds-check
+            // the group index, and asking beyond get_total_chip_count()
+            // returns nonsense (2 MHz) rather than failing.
+            "try: n=int(mxa.get_total_chip_count(0))\n"
+            "except Exception: n=0\n"
             "while True:\n"
             // get_power() does not raise on a part without power telemetry —
             // it returns 0xFFFFFFFF mW, i.e. 4294967.295 W. Gate it here as
@@ -380,7 +425,19 @@ private:
             "  _w=mxa.get_power(0)\n"
             "  w=(_w/1000.0) if (0<=_w<1e6) else float('nan')\n"
             " except Exception: w=float('nan')\n"
-            " sys.stdout.write('%.4f\\n'%w); sys.stdout.flush()\n"
+            // get_frequency_effective(dev, group) is the reading that drops
+            // under thermal throttling; get_frequency() returns the configured
+            // target and would sit flat at 600/850 however hot the part got.
+            // Both take (device, group) — a single int raises TypeError.
+            " fs=[]\n"
+            " for g in range(n):\n"
+            "  try: fs.append(float(mxa.get_frequency_effective(0,g)))\n"
+            "  except Exception: fs.append(float('nan'))\n"
+            " try:\n"
+            "  sys.stdout.write(('%.4f'%w)+''.join(' %.1f'%f for f in fs)+'\\n')\n"
+            "  sys.stdout.flush()\n"
+            " except Exception:\n"
+            "  os._exit(0)\n"
             " time.sleep(1)\n";
         int fds[2];
         if (pipe(fds) != 0) return false;
@@ -413,10 +470,15 @@ private:
         size_t last = complete.rfind('\n');
         std::string line =
             (last == std::string::npos) ? complete : complete.substr(last + 1);
-        try {
-            last_power_ = std::stod(line);
-        } catch (...) {
-        }
+        // The line is "<watts> <clk0> <clk1> ...". std::stod would silently
+        // take only the first field and drop every clock, so parse the stream.
+        std::istringstream ls(line);
+        double w = kNaN;
+        if (!(ls >> w)) return;
+        last_power_ = w;
+        std::vector<double> fs;
+        for (double f; ls >> f;) fs.push_back(f);
+        if (!fs.empty()) last_freqs_ = std::move(fs);
     }
 
     std::string hwmon_;
@@ -424,6 +486,7 @@ private:
     int power_fd_ = -1;
     pid_t helper_pid_ = -1;
     double last_power_ = kNaN;
+    std::vector<double> last_freqs_;   // one effective clock per chip
     std::string pbuf_;
 };
 
@@ -469,6 +532,19 @@ public:
             temp_values_.push_back(kNaN);
         }
 
+        // Per-AI-core clock from `axcmd --clock-all-actual`. Use the ACTUAL
+        // reading, never `--get-ck-profile`, which returns the configured
+        // profile and sits flat however hot the part gets. One series per
+        // core, so a clock reads against the AI0-AI3 temperature beside it.
+        auto axcmds = glob_paths("/opt/axelera/runtime-*/bin/axcmd");
+        if (!axcmds.empty()) {
+            axcmd_ = axcmds.front();
+            for (int i = 0; i < 4; ++i) {
+                freq_metrics_.push_back({"Axelera C" + std::to_string(i), "MHz"});
+                freq_values_.push_back(kNaN);
+            }
+        }
+
         poll();  // seed values + set note_ (version mismatch / idle / no tool)
         return true;
     }
@@ -477,9 +553,32 @@ public:
         auto temps = read_temps();
         for (size_t i = 0; i < temp_values_.size(); ++i)
             temp_values_[i] = (i < temps.size()) ? temps[i] : kNaN;
+        if (!freq_values_.empty()) {
+            auto clocks = read_clocks();
+            for (size_t i = 0; i < freq_values_.size(); ++i)
+                freq_values_[i] = (i < clocks.size()) ? clocks[i] : kNaN;
+        }
     }
 
 private:
+    // "aicore0: 800MHz" -> 800, indexed by core.
+    std::vector<double> read_clocks() {
+        std::string out = run_capture("timeout 4 " + axcmd_ + " --device " +
+                                      device_ + " --clock-all-actual 2>/dev/null");
+        static const std::regex re(R"(aicore(\d+)\s*:\s*([\d.]+)\s*MHz)");
+        std::map<int, double> by_idx;
+        std::istringstream is(out);
+        std::string line;
+        while (std::getline(is, line)) {
+            std::smatch m;
+            if (std::regex_search(line, m, re))
+                by_idx[std::stoi(m[1])] = std::stod(m[2]);
+        }
+        std::vector<double> v;
+        for (auto& [idx, f] : by_idx) { (void)idx; v.push_back(f); }
+        return v;
+    }
+
     std::vector<double> read_temps() {
         if (cli_.empty()) {
             note_ = "triton_trace not found — install the Axelera runtime";
@@ -521,6 +620,7 @@ private:
     }
 
     std::string cli_, device_;
+    std::string axcmd_;   // empty when the runtime's axcmd is not installed
 };
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1518,7 @@ int Probes::pcie_merge_target(size_t k) const {
 void Probes::flatten() {
     temp_metrics_.clear();
     power_metrics_.clear();
+    freq_metrics_.clear();
     energy_metrics_.clear();
     charge_metrics_.clear();
     voltage_metrics_.clear();
@@ -1468,8 +1569,19 @@ void Probes::flatten() {
     emit(&DeviceProbe::syscurrent_metrics, " SYS CURRENT", syscurrent_metrics_);
     emit(&DeviceProbe::syspower_metrics, " SYS POWER", syspower_metrics_);
 
+    // Frequency follows plain discovery order — there is no INA228-style
+    // folding to do, since a clock always belongs to the card reporting it.
+    // That is also why it is not routed through emit(), which applies the
+    // alias ordering the folded families need.
+    for (size_t k = 0; k < devices_.size(); ++k)
+        for (auto m : devices_[k]->freq_metrics()) {
+            stamp(m, k, devices_[k].get());
+            freq_metrics_.push_back(std::move(m));
+        }
+
     temp_values_.assign(temp_metrics_.size(), kNaN);
     power_values_.assign(power_metrics_.size(), kNaN);
+    freq_values_.assign(freq_metrics_.size(), kNaN);
     energy_values_.assign(energy_metrics_.size(), kNaN);
     charge_values_.assign(charge_metrics_.size(), kNaN);
     voltage_values_.assign(voltage_metrics_.size(), kNaN);
@@ -1499,4 +1611,9 @@ void Probes::poll() {
     fill(&DeviceProbe::sysvoltage_values, sysvoltage_values_);
     fill(&DeviceProbe::syscurrent_values, syscurrent_values_);
     fill(&DeviceProbe::syspower_values, syspower_values_);
+
+    // Discovery order, matching flatten() above — not dev_order_.
+    size_t fi = 0;
+    for (auto& d : devices_)
+        for (double v : d->freq_values()) freq_values_[fi++] = v;
 }

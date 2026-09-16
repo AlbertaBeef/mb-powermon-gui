@@ -23,9 +23,16 @@ Python — no shared code). The TUI still has a **PMD2** meter probe the GUI lac
 Port in either direction as needed — the two have no shared code, so it is a
 reimplementation, not a move.
 
-The UI is deliberately simple: **five sections — Bus Voltage, Current, Power,
-Accumulated Energy and Temperature** — each a scrolling 10 min time-series graph
-with a per-device legend of live values.
+The UI is **nine sections**, each a scrolling 10 min time-series graph with a
+per-device legend of live values: System Voltage (V), System Current (A),
+System Power (W), Accelerator Voltage (V), Accelerator Current (A),
+Accelerator Power (W), Accumulated Energy (J), Temperature (°C), Frequency
+(MHz).
+
+**The titles are kept identical to `mb-benchmark-gui`'s**, units and all, so the
+same graph reads the same way in both apps; that project adds three of its own
+(Frame Rate, Efficiency, Energy) and shares every other title verbatim. Change a
+title in one and change it in the other.
 
 **Voltage and Current come before Power on purpose.** The INA228 *measures* VBUS
 and the shunt drop and *derives* POWER as their product, so in this order a
@@ -36,7 +43,9 @@ Energy; over a 10-minute window a monotonic accumulator draws a
 near-straight line whose *slope* is the average power the graph above already
 shows, so its worth is the absolute total on the legend. Each
 legend row also shows a **per-device summary** between the device name and its
-individual entries: temperature averages its sensors (`avg 60°C`), power takes
+individual entries: temperature takes the **max** across its sensors
+(`max 60°C`) — the hottest die is what throttles, and a mean hides one die
+running well above its neighbours — power takes
 the max of its readings (`max 0.93 W`). It does **not** show
 CPU/Memory/Network/Disk — an earlier iteration did (styled exactly like System
 Monitor's resource graphs) but that was scrapped; if you find any reference to
@@ -126,8 +135,8 @@ Clean split between data and UI — keep it that way.
   - **BoardThermalProbe** — board *ambient*, from a TMP401-family chip's hwmon
     `temp1_input` (TI TMP411 at i2c-19 0x4c on the IQ-9075). Kept a **separate
     DeviceProbe on purpose**: it is board temperature, not NPU die temperature, so
-    it earns its own legend row and its own `avg` instead of dragging the NSP
-    average toward ambient. `bdf_` is the i2c locator (`i2c-19 0x4c`). Only the
+    it earns its own legend row and its own aggregate instead of dragging the
+    NSP reading toward ambient. `bdf_` is the i2c locator (`i2c-19 0x4c`). Only the
     local channel is exposed — `temp2` (remote diode, ~65 °C, `temp2_fault=0`, so
     genuinely connected) is left out because what it measures is unknowable
     without the schematic. Nothing binds this chip automatically (absent from
@@ -223,7 +232,8 @@ the graphs/legend automatically — the UI is metric-agnostic.
   intentionally the original near-white, not pure white). Title bar = Teal via an
   app-scoped `Gtk::CssProvider`. Don't reintroduce ad-hoc RGB.
 - **Legend** is one row per device: `<bdf> <b>Name</b>`, then the optional
-  per-device aggregate (`avg`/`max`, a dim label at grid column 1), then the
+  per-device aggregate (`max` for temperature and power, `avg` for frequency;
+  a dim label at grid column 1), then the
   device's swatch+shortlabel+value entries in aligned grid columns (device prefix
   stripped from each label). Keep `value_labels_out` in metric order for the tick
   to update; the aggregate labels ride in a parallel `AggEntry` vector.

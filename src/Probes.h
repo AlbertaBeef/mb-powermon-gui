@@ -48,6 +48,11 @@ public:
     const std::vector<double>& temp_values() const { return temp_values_; }
     const std::vector<MetricInfo>& power_metrics() const { return power_metrics_; }
     const std::vector<double>& power_values() const { return power_values_; }
+    // Core clock (MHz). Its own family: a clock always belongs to the card
+    // reporting it, so unlike the INA228 families there is nothing to fold,
+    // and it follows plain discovery order in Probes::flatten().
+    const std::vector<MetricInfo>& freq_metrics() const { return freq_metrics_; }
+    const std::vector<double>& freq_values() const { return freq_values_; }
     // Accumulated energy (J) and charge (C) since discovery. Only the INA228
     // shunts have these — they are hardware accumulators integrating at the ADC
     // rate, not something derived from the 1 Hz samples.
@@ -85,6 +90,8 @@ public:
 protected:
     std::vector<MetricInfo> temp_metrics_;
     std::vector<double> temp_values_;
+    std::vector<MetricInfo> freq_metrics_;
+    std::vector<double> freq_values_;
     std::vector<MetricInfo> power_metrics_;
     std::vector<double> power_values_;
     std::vector<MetricInfo> energy_metrics_;
@@ -117,6 +124,9 @@ public:
     const std::vector<double>& temp_values() const { return temp_values_; }
     const std::vector<MetricInfo>& power_metrics() const { return power_metrics_; }
     const std::vector<double>& power_values() const { return power_values_; }
+    // Core clock (MHz), plain discovery order — see DeviceProbe::freq_metrics.
+    const std::vector<MetricInfo>& freq_metrics() const { return freq_metrics_; }
+    const std::vector<double>& freq_values() const { return freq_values_; }
     // Accumulated energy (J) / charge (C) from the INA228 shunts, folded onto
     // the card each one measures. Empty on a host with no shunts.
     const std::vector<MetricInfo>& energy_metrics() const { return energy_metrics_; }
@@ -151,8 +161,8 @@ private:
     int pcie_merge_target(size_t k) const;
 
     std::vector<std::unique_ptr<DeviceProbe>> devices_;
-    std::vector<MetricInfo> temp_metrics_, power_metrics_;
-    std::vector<double> temp_values_, power_values_;
+    std::vector<MetricInfo> temp_metrics_, power_metrics_, freq_metrics_;
+    std::vector<double> temp_values_, power_values_, freq_values_;
     std::vector<MetricInfo> sysvoltage_metrics_, syscurrent_metrics_,
         syspower_metrics_;
     std::vector<double> sysvoltage_values_, syscurrent_values_, syspower_values_;

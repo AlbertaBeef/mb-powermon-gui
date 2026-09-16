@@ -68,7 +68,10 @@ private:
 
     GraphArea* temp_graph_ = nullptr;
     std::vector<Gtk::Label*> temp_values_;
-    std::vector<AggEntry> temp_avg_labels_;
+    GraphArea* freq_graph_ = nullptr;
+    std::vector<Gtk::Label*> freq_values_;
+    std::vector<AggEntry> freq_agg_labels_;
+    std::vector<AggEntry> temp_agg_labels_;
 
     // Accumulated energy from the INA228 hardware accumulators. Stays null on a
     // host with no shunts — the section is only built when the family is

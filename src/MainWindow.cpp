@@ -31,6 +31,12 @@ std::string fmt_temp(double v) {
     std::snprintf(b, sizeof(b), "%.0f°C", v);
     return b;
 }
+std::string fmt_freq(double v) {
+    if (std::isnan(v)) return "—";
+    char b[24];
+    std::snprintf(b, sizeof(b), "%.0f MHz", v);
+    return b;
+}
 std::string fmt_power(double v) {
     if (std::isnan(v)) return "—";
     char b[24];
@@ -156,7 +162,7 @@ MainWindow::MainWindow() {
     // beside a card's 0.85 W, flattens the trace that matters.
     if (!probes_.sysvoltage_metrics().empty()) {
         root->append(make_section(
-            "System Voltage",
+            "System Voltage (V)",
             build_metric_section(probes_.sysvoltage_metrics(),
                                  colors_for(probes_.sysvoltage_metrics()),
                                  /*percent_temp_axis=*/false, fmt_volts,
@@ -169,7 +175,7 @@ MainWindow::MainWindow() {
 
     if (!probes_.syscurrent_metrics().empty()) {
         root->append(make_section(
-            "System Current",
+            "System Current (A)",
             build_metric_section(probes_.syscurrent_metrics(),
                                  colors_for(probes_.syscurrent_metrics()),
                                  /*percent_temp_axis=*/false, fmt_amps,
@@ -182,7 +188,7 @@ MainWindow::MainWindow() {
 
     if (!probes_.syspower_metrics().empty()) {
         root->append(make_section(
-            "System Power",
+            "System Power (W)",
             build_metric_section(probes_.syspower_metrics(),
                                  colors_for(probes_.syspower_metrics()),
                                  /*percent_temp_axis=*/false, fmt_power,
@@ -195,7 +201,7 @@ MainWindow::MainWindow() {
 
     if (!probes_.voltage_metrics().empty()) {
         root->append(make_section(
-            "Accelerator Voltage",
+            "Accelerator Voltage (V)",
             build_metric_section(probes_.voltage_metrics(),
                                  colors_for(probes_.voltage_metrics()),
                                  /*percent_temp_axis=*/false, fmt_volts,
@@ -213,7 +219,7 @@ MainWindow::MainWindow() {
     // rather than being silently absorbed.
     if (!probes_.current_metrics().empty()) {
         root->append(make_section(
-            "Accelerator Current",
+            "Accelerator Current (A)",
             build_metric_section(probes_.current_metrics(),
                                  colors_for(probes_.current_metrics()),
                                  /*percent_temp_axis=*/false, fmt_amps,
@@ -225,7 +231,7 @@ MainWindow::MainWindow() {
     }
 
     root->append(make_section(
-        "Accelerator Power",
+        "Accelerator Power (W)",
         build_metric_section(probes_.power_metrics(),
                              colors_for(probes_.power_metrics()),
                              /*percent_temp_axis=*/false, fmt_power, power_graph_,
@@ -237,7 +243,7 @@ MainWindow::MainWindow() {
     // Accumulated energy sits with Power because it is its integral.
     if (!probes_.energy_metrics().empty()) {
         root->append(make_section(
-            "Accumulated Energy",
+            "Accumulated Energy (J)",
             build_metric_section(probes_.energy_metrics(),
                                  colors_for(probes_.energy_metrics()),
                                  /*percent_temp_axis=*/false, fmt_joules,
@@ -252,12 +258,30 @@ MainWindow::MainWindow() {
     }
 
     root->append(make_section(
-        "Temperature",
+        "Temperature (°C)",
         build_metric_section(probes_.temp_metrics(),
                              colors_for(probes_.temp_metrics()),
                              /*percent_temp_axis=*/true, fmt_temp, temp_graph_,
                              temp_values_, "No temperature sensors detected.",
-                             &temp_avg_labels_)));
+                             &temp_agg_labels_)));
+
+    // Clock, right after temperature because the two are read together: a
+    // frequency that sags while a die heats is thermal throttling, and seeing
+    // them adjacent is the whole point. Collapsed by default — it is
+    // diagnostic rather than something to watch continuously.
+    root->append(make_section(
+        "Frequency (MHz)",
+        build_metric_section(probes_.freq_metrics(),
+                             colors_for(probes_.freq_metrics()),
+                             /*percent_temp_axis=*/false, fmt_freq, freq_graph_,
+                             freq_values_,
+                             "No accelerator here reports a core clock. All "
+                             "four M.2 cards can: Hailo via the extended device "
+                             "information, DeepX per NPU via dxrt-cli, MemryX "
+                             "per chip via the SDK, and Axelera per AI core via "
+                             "axcmd --clock-all-actual.",
+                             &freq_agg_labels_, /*min_axis_max=*/1000.0),
+        /*expanded=*/false));
 
     Glib::signal_timeout().connect(sigc::mem_fun(*this, &MainWindow::on_tick),
                                    kIntervalMs);
@@ -432,17 +456,41 @@ bool MainWindow::on_tick() {
         temp_graph_->push(tv);
         for (size_t i = 0; i < temp_values_.size() && i < tv.size(); ++i)
             temp_values_[i]->set_text(fmt_temp(tv[i]));
-        for (const auto& a : temp_avg_labels_) {
-            double sum = 0.0;
+        for (const auto& a : temp_agg_labels_) {
+            // MAX, not mean: a card's sensors sit on different dies and the
+            // hottest one is what throttles or trips. Averaging four sensors
+            // buries a single die running 20 C above its neighbours, which is
+            // exactly the case the row exists to surface. Power's row already
+            // uses max for the same reason.
+            double hottest = 0.0;
             int cnt = 0;
             for (int k = a.start;
                  k < a.start + a.count && k < static_cast<int>(tv.size()); ++k) {
                 if (!std::isnan(tv[k])) {
-                    sum += tv[k];
+                    if (!cnt || tv[k] > hottest) hottest = tv[k];
                     ++cnt;
                 }
             }
-            a.label->set_text(cnt ? "avg " + fmt_temp(sum / cnt) : "avg —");
+            a.label->set_text(cnt ? "max " + fmt_temp(hottest) : "max —");
+        }
+    }
+
+    const auto& fv = probes_.freq_values();
+    if (freq_graph_ && !fv.empty() &&
+        static_cast<int>(fv.size()) == freq_graph_->series_count()) {
+        freq_graph_->push(fv);
+        for (size_t i = 0; i < freq_values_.size() && i < fv.size(); ++i)
+            freq_values_[i]->set_text(fmt_freq(fv[i]));
+        for (const auto& a : freq_agg_labels_) {
+            // Mean here, unlike temperature: throttling moves every chip of a
+            // card together, so the average reads as "the card's clock".
+            double sum = 0.0;
+            int cnt = 0;
+            for (int k = a.start;
+                 k < a.start + a.count && k < static_cast<int>(fv.size()); ++k) {
+                if (!std::isnan(fv[k])) { sum += fv[k]; ++cnt; }
+            }
+            a.label->set_text(cnt ? "avg " + fmt_freq(sum / cnt) : "avg —");
         }
     }
 

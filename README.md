@@ -10,7 +10,7 @@ native desktop window.
 
 ## What it shows
 
-Eight sections, each a scrolling 10-minute graph with a per-device legend of
+Nine sections, each a scrolling 10-minute graph with a per-device legend of
 live values. Everything except Power and Temperature is collapsed by default:
 
 - **System Voltage / Current / Power** — the whole board, from an inline
@@ -24,6 +24,13 @@ live values. Everything except Power and Temperature is collapsed by default:
   accumulators, integrated at the ADC rate rather than sampled.
 - **Temperature (°C)** — one trace per on-die sensor, 0–100 °C axis that expands
   if a sensor goes above 100.
+- **Frequency (MHz)** — core clock, one trace per clock domain. All four M.2
+  cards report one, each from a different place: Hailo from the extended device
+  information, DeepX per NPU from the same `dxrt-cli -s` line as the
+  temperature, MemryX per chip over the SDK helper, Axelera per AI core from
+  `axcmd --clock-all-actual`. It sits directly under Temperature because a
+  clock sagging while a die heats **is** thermal throttling, and the two are
+  only legible side by side.
 
 **Voltage and Current sit above Power on purpose.** The INA228 *measures* bus
 voltage and the shunt drop and *derives* watts from them, so in this order a
@@ -36,8 +43,13 @@ both graphs, and the legend groups metrics **one device per row** (prefixed with
 the PCIe BDF), e.g. `0000:c2:00.0 Axelera  SYS · AI0 · AI1 · AI2 · AI3`.
 
 Each device row also carries a **per-device summary** between the name and the
-individual readings: temperature shows the device's **average** across its
-sensors (`avg 60°C`), power shows the **max** across its readings (`max 0.93 W`).
+individual readings: temperature shows the device's **max** across its sensors
+(`max 60°C`), and so does power (`max 0.93 W`). Temperature used to average.
+It takes the max because a card's sensors sit on different dies and the hottest
+one is what throttles or trips — averaging four buries a single die running
+20 °C above its neighbours, which is the case the row exists to surface.
+Frequency still averages, because throttling moves a card's chips together, so
+the mean reads as "the card's clock".
 The max spans *all* of a device's power metrics, so where an external INA228 meter
 is mapped onto a card (see [Configuration](#configuration)) the row shows both its
 on-die `POW` and the shunt `INA228` reading, and the summary reports the larger.
@@ -98,8 +110,8 @@ Undo at any time with
 `echo 0x4c | sudo tee /sys/bus/i2c/devices/i2c-19/delete_device`.
 
 This is **board** temperature, not NPU die temperature, so it gets its own legend
-row and its own `avg` — folding it into the NPU row would drag that average
-toward ambient. The chip also has a valid remote-diode channel (`temp2`, ~65 °C,
+row and its own aggregate — folding it into the NPU row would drag that
+reading toward ambient. The chip also has a valid remote-diode channel (`temp2`, ~65 °C,
 `temp2_fault=0`), but what that diode is wired to can't be determined without the
 board schematic, so it is deliberately not exposed rather than labelled with a
 guess.
@@ -279,8 +291,8 @@ gio set ~/Desktop/mb-powermon-gui.desktop metadata::trusted true
 ## Design
 
 - **Sampling** runs once per second; each graph keeps a 10-minute (601-point)
-  history and draws newest-on-the-right. The per-device summary (avg temp / max
-  power) is recomputed each tick, skipping any `NaN` readings.
+  history and draws newest-on-the-right. The per-device summary (max temp / max
+  power / avg clock) is recomputed each tick, skipping any `NaN` readings.
 - **Colors** come only from the project brand palette, and each accelerator has a
   **fixed** one — Coral = Hailo, Sage = MemryX, Slate Blue = DeepX, Amber =
   Axelera, Plum = Qualcomm — assigned by `util::device_accent()` rather than by
