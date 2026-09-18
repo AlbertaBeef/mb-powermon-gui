@@ -47,6 +47,37 @@ void GraphArea::set_series_color(int i, const Gdk::RGBA& c) {
     if (i >= 0 && i < static_cast<int>(colors_.size())) colors_[i] = c;
 }
 
+void GraphArea::set_time_span(int span_seconds) {
+    const int s = std::max(1, span_seconds);
+    if (!auto_span_ && span_seconds_ == s) return;
+    span_seconds_ = s;
+    auto_span_ = false;
+    queue_draw();
+}
+
+void GraphArea::set_auto_time_span(bool on) {
+    if (auto_span_ == on) return;
+    auto_span_ = on;
+    queue_draw();
+}
+
+// Samples on screen, and the seconds they cover at the 1 Hz push rate. A fixed
+// window is what was asked for, capped by what the buffer can actually hold —
+// so the time labels never promise more history than exists. Auto follows the
+// data: two samples in, the plot is two seconds wide.
+void GraphArea::view_window(int& samples, int& span) const {
+    int m = history_;
+    if (auto_span_) {
+        int have = 0;
+        for (const auto& s : series_) have = std::max(have, int(s.size()));
+        m = std::clamp(have, 2, history_);
+    } else {
+        m = std::min(history_, span_seconds_ + 1);
+    }
+    samples = std::max(2, m);
+    span = samples - 1;
+}
+
 void GraphArea::push(const std::vector<double>& values) {
     if (series_.size() != values.size()) return;
     for (size_t i = 0; i < series_.size(); ++i) {
@@ -80,6 +111,10 @@ void GraphArea::reset() {
 // in the bottom half of the plot, which is the readability problem the headroom
 // rule exists to avoid.
 void GraphArea::axis_range(double& lo, double& hi) const {
+    // Only the samples on screen set the scale. Reading the whole buffer would
+    // let a peak from twenty minutes ago flatten a one-minute window.
+    int view = 0, view_span = 0;
+    view_window(view, view_span);
     // Never zero-width: draw() divides by (hi - lo), and a caller is free to
     // pass a 0 floor to set_min_axis_max().
     const double base = std::max(percent_mode_      ? 1.0
@@ -91,7 +126,9 @@ void GraphArea::axis_range(double& lo, double& hi) const {
     for (size_t si = 0; si < series_.size(); ++si) {
         if (si < visible_.size() && !visible_[si]) continue;
         const auto& s = series_[si];
-        for (double v : s) {
+        const size_t from = s.size() > size_t(view) ? s.size() - view : 0;
+        for (size_t k = from; k < s.size(); ++k) {
+            const double v = s[k];
             if (std::isnan(v)) continue;
             if (!any) { peak = trough = v; any = true; continue; }
             peak = std::max(peak, v);
@@ -186,13 +223,17 @@ void GraphArea::draw(const Cairo::RefPtr<Cairo::Context>& cr, int w, int h) {
     // Vertical grid + time labels. The step adapts to the span: a 60 s window
     // keeps its 10 s marks, while a 10 min one gets 2 min marks instead of
     // sixty gridlines. Largest nice step that still leaves >= 5 divisions.
-    int label_step = 10;
-    for (int cand : {10, 15, 30, 60, 120, 300, 600}) {
+    // The candidate list starts at 1 s because an Auto window is only as wide
+    // as the data: a few seconds after a reset there is no 10 s mark to draw.
+    int view_samples = 0, view_span = 0;
+    view_window(view_samples, view_span);
+    int label_step = 1;
+    for (int cand : {1, 2, 5, 10, 15, 30, 60, 120, 300, 600}) {
         label_step = cand;
-        if (span_seconds_ / cand <= 8) break;
+        if (view_span / cand <= 8) break;
     }
-    for (int t = span_seconds_; t >= label_step; t -= label_step) {
-        double x = px + pw * (1.0 - double(t) / span_seconds_);
+    for (int t = view_span; t >= label_step; t -= label_step) {
+        double x = px + pw * (1.0 - double(t) / view_span);
         use(util::neutral::slate_gray(), 0.18);
         cr->set_line_width(1.0);
         cr->move_to(std::round(x) + 0.5, py);
@@ -205,7 +246,7 @@ void GraphArea::draw(const Cairo::RefPtr<Cairo::Context>& cr, int w, int h) {
         use(util::neutral::slate_gray());
         Cairo::TextExtents ext;
         cr->get_text_extents(label, ext);
-        double lx = x - (t == span_seconds_ ? 0 : ext.width / 2);
+        double lx = x - (t == view_span ? 0 : ext.width / 2);
         cr->move_to(lx, py + ph + 13);
         cr->show_text(label);
     }
@@ -216,21 +257,26 @@ void GraphArea::draw(const Cairo::RefPtr<Cairo::Context>& cr, int w, int h) {
     cr->rectangle(px + 0.5, py + 0.5, pw, ph);
     cr->stroke();
 
-    // Traces. Oldest sample sits (history_-1) steps left of the right edge so
-    // short histories scroll in from the right.
+    // Traces. Only the last `view_samples` of each series are drawn, and the
+    // oldest of them sits (view_samples-1) steps left of the right edge — so a
+    // history shorter than the window scrolls in from the right, and an Auto
+    // window (where the two are equal) always fills the plot.
     cr->save();
     cr->rectangle(px, py, pw, ph);
     cr->clip();
-    const double step = pw / std::max(1, history_ - 1);
+    const double step = pw / std::max(1, view_samples - 1);
     for (size_t s = 0; s < series_.size(); ++s) {
         if (s < visible_.size() && !visible_[s]) continue;
         const auto& d = series_[s];
-        if (d.size() < 2) continue;
-        const int m = static_cast<int>(d.size());
+        const int total = static_cast<int>(d.size());
+        const int m = std::min(total, view_samples);
+        if (m < 2) continue;
+        const int off = total - m;   // index of the oldest sample on screen
 
+        auto vat = [&](int j) { return d[off + j]; };
         auto px_at = [&](int j) { return px + pw - (m - 1 - j) * step; };
         auto py_at = [&](int j) {
-            double v = std::clamp((d[j] - axis_lo) / axis_span, 0.0, 1.0);
+            double v = std::clamp((vat(j) - axis_lo) / axis_span, 0.0, 1.0);
             return py + ph * (1.0 - v);
         };
 
@@ -240,9 +286,9 @@ void GraphArea::draw(const Cairo::RefPtr<Cairo::Context>& cr, int w, int h) {
             // Fill each contiguous (non-NaN) run down to the baseline.
             int j = 0;
             while (j < m) {
-                if (std::isnan(d[j])) { ++j; continue; }
+                if (std::isnan(vat(j))) { ++j; continue; }
                 int k = j;
-                while (k < m && !std::isnan(d[k])) ++k;  // [j, k)
+                while (k < m && !std::isnan(vat(k))) ++k;  // [j, k)
                 cr->move_to(px_at(j), py + ph);
                 for (int i = j; i < k; ++i) cr->line_to(px_at(i), py_at(i));
                 cr->line_to(px_at(k - 1), py + ph);
@@ -259,7 +305,7 @@ void GraphArea::draw(const Cairo::RefPtr<Cairo::Context>& cr, int w, int h) {
         cr->set_line_width(1.25);
         bool pen_down = false;
         for (int j = 0; j < m; ++j) {
-            if (std::isnan(d[j])) { pen_down = false; continue; }
+            if (std::isnan(vat(j))) { pen_down = false; continue; }
             if (!pen_down) { cr->move_to(px_at(j), py_at(j)); pen_down = true; }
             else            { cr->line_to(px_at(j), py_at(j)); }
         }

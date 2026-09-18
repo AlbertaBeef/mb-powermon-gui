@@ -58,6 +58,7 @@ add_executable(mb-powermon
   src/main.cpp
   src/Probes.cpp
   src/GraphArea.cpp
+  src/GraphControls.cpp
   src/MainWindow.cpp
   ${GRESOURCE_C}
 )

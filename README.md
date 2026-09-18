@@ -10,12 +10,17 @@ native desktop window.
 
 ## What it shows
 
-Nine sections, each a scrolling 10-minute graph with a per-device legend of
-live values. Everything except Power and Temperature is collapsed by default:
+A **Graphs** control pane on the left, and nine sections on the right, each a
+scrolling graph with a per-device legend of live values. The toggle at the left
+of the header bar (or **Ctrl+B**) collapses the pane and gives its width to the
+graphs; nothing is reset by hiding it. Everything except Power and Temperature is
+collapsed by default:
 
-- **System Voltage / Current / Power** — the whole board, from an inline
-  ChargerLAB POWER-Z KM003C on the USB-C supply. Present only where that meter
-  is; it is board total, never a card's draw.
+- **System Voltage / Current / Power** — the whole board, from an inline meter:
+  a **ChargerLAB POWER-Z KM003C** on a USB-C supply, an **ElmorLabs PMD2** on a
+  PSU harness, or both. Present only where such a meter is; it is board total,
+  never a card's draw. The PMD2 publishes its ten rails plus the EPS / PCIE / MB
+  group subtotals and the board TOTAL.
 - **Accelerator Voltage (V)** — rail voltage per INA228 shunt.
 - **Accelerator Current (A)** — rail current per shunt, sign-corrected per rail.
 - **Accelerator Power (W)** — one trace per power reading, 10 W default axis
@@ -31,6 +36,30 @@ live values. Everything except Power and Temperature is collapsed by default:
   `axcmd --clock-all-actual`. It sits directly under Temperature because a
   clock sagging while a die heats **is** thermal throttling, and the two are
   only legible side by side.
+
+The **Graphs** pane drives all of them and is display-only — nothing it does
+changes what is measured:
+
+| Control | What it does |
+| ------- | ------------ |
+| **Legends** | Show or hide the per-device legend under every graph. |
+| **Values Range** | How every axis responds to its data. **Fixed** leaves each axis at its resting top and clips above it; **Max** *(default)* grows to 10 % above the highest reading and never shrinks back, so sessions stay comparable; **Dynamic** tracks the data at both ends, filling the plot at the cost of a moving scale. |
+| **Time Range** | How much wall-clock time is on screen. The graphs keep 30 minutes either way, so moving the window never throws samples away. **Auto** shows exactly what has been collected — the traces fill the plot from the first sample; otherwise a fixed **1–30 min** window *(default 5)*, newest sample at the right edge. |
+
+The **Accelerators** frame is one row per card — its name and an `Enabled`
+switch. Unticking a card hides its traces **and** its legend entry, including the
+history already on screen, and drops it from the axis calculation so the rest
+fill the plot. It is still measured; the legend values keep updating. The meters
+are not here — each has its own switch under **Telemetry**.
+
+The **Telemetry** frame picks which *instruments* are drawn, one row per
+meter, and a row appears only where that meter was found:
+
+| Telemetry | What it does |
+| --------- | ------------ |
+| **POWER-Z** | `Enabled` — draw the ChargerLAB POWER-Z KM003C on the System graphs. |
+| **PMD2** | One checkbox per ElmorLabs PMD2 measurement *point*, so ticking `ATX12V` governs its watts, volts and amps together. Laid out in the meter's own tiers: **Enabled** alone, then the board **TOTAL** with the three group subtotals (EPS / PCIE / MB), then the ten individual rails. **Enabled** greys the rest rather than clearing them, so a chosen subset comes back when you tick it again. |
+| **INA228** | `Enabled` — draw the INA228 shunts on the Accelerator graphs: power, voltage, current, energy and the monitor's own die temperature. |
 
 **Voltage and Current sit above Power on purpose.** The INA228 *measures* bus
 voltage and the shunt drop and *derives* watts from them, so in this order a

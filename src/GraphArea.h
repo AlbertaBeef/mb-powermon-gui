@@ -13,9 +13,22 @@
 
 class GraphArea : public Gtk::DrawingArea {
 public:
-    // history: max number of points kept per series (also the x-axis extent).
+    // history: max number of points kept per series — the buffer *capacity*.
     // span_seconds: wall-clock width of the plot, for the time labels.
     GraphArea(int history, int span_seconds);
+
+    // The time window actually drawn. `history` above is only how much is
+    // kept; what is plotted is the trailing slice of it named here, so
+    // narrowing the window discards nothing and widening it again brings the
+    // older samples back.
+    //   set_time_span()      — the last span_seconds + 1 samples, clamped to
+    //                          what the buffer holds.
+    //   set_auto_time_span() — everything collected so far, so a young trace
+    //                          fills the plot from the left edge instead of
+    //                          hiding off to the right of it.
+    void set_time_span(int span_seconds);
+    void set_auto_time_span(bool on);
+    bool auto_time_span() const { return auto_span_; }
 
     void set_series(const std::vector<Gdk::RGBA>& colors);
     void set_series_color(int i, const Gdk::RGBA& c);
@@ -26,6 +39,14 @@ public:
     // minutes of hidden traces on screen.
     void set_series_visible(int i, bool on);
     void set_all_series_visible(bool on);
+    // Whether series i is currently drawn. The legend's per-device aggregate
+    // reads this: a hidden trace must not reach a max/min/total, or the row
+    // reports a figure from a line nobody can see. Out-of-range reads true,
+    // matching set_series_visible()'s silent no-op on a bad index.
+    bool series_visible(int i) const {
+        return i < 0 || i >= static_cast<int>(visible_.size()) ? true
+                                                              : visible_[i];
+    }
     int series_count() const { return static_cast<int>(series_.size()); }
 
     // Push one new sample per series (same order as set_series). Values are in
@@ -67,9 +88,15 @@ private:
     // The visible value range. `lo` is 0 in every mode but Dynamic, where it
     // tracks the trough so a narrow band of readings fills the plot height.
     void axis_range(double& lo, double& hi) const;
+    // The window on screen: how many trailing samples, and how many seconds
+    // that is. Both the axis calculation and the trace drawing must use this
+    // and not the buffer, or a narrowed window would still be scaled by data
+    // nobody can see.
+    void view_window(int& samples, int& span) const;
 
     int history_;
     int span_seconds_;
+    bool auto_span_ = false;
     bool percent_mode_ = true;
     bool fill_ = false;
     double fixed_max_ = 0.0;

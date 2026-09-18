@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <glob.h>
+#include <termios.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -884,6 +885,208 @@ private:
     std::string volt_path_, curr_path_, temp_path_;
 };
 
+// ---------------------------------------------------------------------------
+// ElmorLabs PMD2 — inline DC power meter on the PSU harness, read over USB CDC.
+// Like PowerZProbe it is a SYSTEM instrument, never a card's rail: everything
+// goes to sysvoltage_/syscurrent_/syspower_, which keeps board watts off the
+// per-card graphs. (In mb-benchmark-gui that separation also keeps them out of
+// power_for_device(), where they would inflate every efficiency figure; there
+// is no such function here, but the families must not be merged either way.)
+//
+// Protocol lifted from mb-powermon.py's PMD2Probe (itself from
+// ElmorLabs/PMD2-Python): 115200 8N1 raw; 0x01 -> 3 bytes {vid, pid, fw};
+// 0x04 -> a 122-byte packed SensorStruct:
+//
+//   uint16 Vdd_mV; int16 Tchip; 10 x { int16 V_mV; int32 I_mA; int32 P_mW };
+//   uint16 EpsPower, PciePower, MbPower, TotalPower;  (WHOLE WATTS)
+//   uint8 Ocp[10];
+//
+// **Everything measurable is published and therefore always logged** — one
+// TOTAL, three group aggregates, and all ten rails in V, A and W: 34 metrics.
+// Selecting what to *graph* is a UI filter (Graphs -> PMD2), never a change to
+// what is discovered: `discover()` runs once and the Logger header is written
+// once at open, so a metric that came and went would break both the fixed
+// header and the rule that two logs from one binary stay diffable.
+//
+// Resolution is why the rails matter even though the groups look sufficient:
+// the four aggregates are uint16 WHOLE WATTS, so MB moves in 1 W steps — too
+// coarse to show an accelerator's delta — while the rails are mV/mA/mW.
+// Verified self-consistent 2026-09-18: EPS 93 + MB 26 = TOTAL 119, and
+// ATX12V+5V+5VSB+3.3V = 25.4 W against MB's 26.
+//
+// Deliberately NOT published: Tchip (the meter's own STM32 die — not the system
+// and not any card, the same reason PowerZ's in1..in5 are suppressed) and the
+// OCP flag bytes. Rails reading zero (HPWR1, PCIE1..3 on an all-M.2 host) ARE
+// published: a flat zero is a measurement, and suppressing them would make the
+// CSV schema depend on what happened to be plugged in.
+// ---------------------------------------------------------------------------
+class PMD2Probe : public DeviceProbe {
+public:
+    const char* name() const override { return name_.c_str(); }
+
+    bool discover() {
+        for (const auto& t : glob_paths("/sys/class/tty/ttyACM*")) {
+            const std::string dev = realpath_of(t + "/device/..");
+            if (dev.empty()) continue;
+            if (trim_sysfs(read_file(dev + "/idVendor")) != "0483") continue;
+            if (trim_sysfs(read_file(dev + "/idProduct")) != "5740") continue;
+            if (!open_port("/dev/" + basename_of(t))) continue;
+            bdf_ = "usb " + basename_of(dev);  // matches the INA228 "usb <port>" form
+            break;
+        }
+        if (fd_ < 0) return false;
+        Sensor s{};
+        if (!read_sensor(&s)) { close_port(); return false; }
+
+        // Order is the display order: total, then groups, then rails. The
+        // legend groups by contiguous runs of device index, so keeping them
+        // together keeps PMD2 to one row.
+        // Every family shares ONE CSV namespace: the column is <bdf>_<LABEL>
+        // with the device prefix stripped, so a rail labelled just "ATX12V" in
+        // three families would emit the SAME column three times. Suffix each
+        // with its family, exactly as the INA228 metrics do
+        // (<Card> INA228 POWER/VBUS/CURRENT) and for the same reason.
+        syspower_metrics_.push_back({name_ + std::string(" TOTAL"), "W"});
+        for (const char* g : kGroupNames)
+            syspower_metrics_.push_back({name_ + " " + g + " POWER", "W"});
+        for (const char* r : kRailNames)
+            syspower_metrics_.push_back({name_ + " " + r + " POWER", "W"});
+        syspower_values_.assign(syspower_metrics_.size(), kNaN);
+
+        for (const char* r : kRailNames) {
+            sysvoltage_metrics_.push_back({name_ + " " + r + " VBUS", "V"});
+            syscurrent_metrics_.push_back({name_ + " " + r + " CURRENT", "A"});
+        }
+        sysvoltage_values_.assign(sysvoltage_metrics_.size(), kNaN);
+        syscurrent_values_.assign(syscurrent_metrics_.size(), kNaN);
+
+        note_ = "PMD2 fw v" + std::to_string(fw_);
+        poll();
+        return true;
+    }
+
+    void poll() override {
+        Sensor s{};
+        if (!read_sensor(&s)) {
+            for (auto& v : syspower_values_) v = kNaN;
+            for (auto& v : sysvoltage_values_) v = kNaN;
+            for (auto& v : syscurrent_values_) v = kNaN;
+            return;
+        }
+        size_t k = 0;
+        syspower_values_[k++] = plausible_power(s.total_w);
+        syspower_values_[k++] = plausible_power(s.eps_w);
+        syspower_values_[k++] = plausible_power(s.pcie_w);
+        syspower_values_[k++] = plausible_power(s.mb_w);
+        for (int i = 0; i < 10; ++i)
+            syspower_values_[k++] = plausible_power(s.rail_mw[i] / 1000.0);
+        for (int i = 0; i < 10; ++i) {
+            sysvoltage_values_[i] = s.rail_mv[i] / 1000.0;
+            syscurrent_values_[i] = s.rail_ma[i] / 1000.0;
+        }
+    }
+
+    ~PMD2Probe() override { close_port(); }
+
+private:
+    struct Sensor {
+        double rail_mv[10], rail_ma[10], rail_mw[10];
+        double eps_w, pcie_w, mb_w, total_w;
+    };
+    static const char* const kGroupNames[3];
+    static const char* const kRailNames[10];
+    static constexpr size_t kSensorSize = 122;
+
+    bool open_port(const std::string& node) {
+        fd_ = ::open(node.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd_ < 0) return false;
+        termios t{};
+        if (tcgetattr(fd_, &t) != 0) { close_port(); return false; }
+        cfmakeraw(&t);
+        cfsetispeed(&t, B115200);
+        cfsetospeed(&t, B115200);
+        t.c_cflag |= (CLOCAL | CREAD);
+        t.c_cc[VMIN] = 0;
+        t.c_cc[VTIME] = 0;  // non-blocking; read_exact does its own timeout
+        if (tcsetattr(fd_, TCSANOW, &t) != 0) { close_port(); return false; }
+        tcflush(fd_, TCIOFLUSH);
+        // Identify. A tty with the right USB ids that does not answer 0x01 is
+        // not a PMD2, so this is the check, not the VID/PID match alone.
+        unsigned char cmd = 0x01, buf[3];
+        if (::write(fd_, &cmd, 1) != 1) { close_port(); return false; }
+        if (read_exact(buf, sizeof buf, 1000) != sizeof buf) { close_port(); return false; }
+        fw_ = buf[2];
+        return true;
+    }
+
+    void close_port() {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+    }
+
+    // All n bytes or nothing. A short read would desynchronise every later
+    // poll, so it is a failure and the buffer is flushed rather than patched.
+    ssize_t read_exact(unsigned char* dst, size_t n, int timeout_ms) {
+        size_t got = 0;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (got < n && std::chrono::steady_clock::now() < deadline) {
+            const ssize_t r = ::read(fd_, dst + got, n - got);
+            if (r > 0) { got += static_cast<size_t>(r); continue; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return static_cast<ssize_t>(got);
+    }
+
+    bool read_sensor(Sensor* out) {
+        if (fd_ < 0) return false;
+        tcflush(fd_, TCIFLUSH);
+        unsigned char cmd = 0x04;
+        if (::write(fd_, &cmd, 1) != 1) return false;
+        unsigned char b[kSensorSize];
+        if (read_exact(b, kSensorSize, 500) != static_cast<ssize_t>(kSensorSize)) {
+            tcflush(fd_, TCIFLUSH);
+            return false;
+        }
+        auto u16 = [&](size_t o) { return static_cast<double>(b[o] | (b[o + 1] << 8)); };
+        auto i16 = [&](size_t o) {
+            return static_cast<double>(static_cast<int16_t>(b[o] | (b[o + 1] << 8)));
+        };
+        auto i32 = [&](size_t o) {
+            return static_cast<double>(static_cast<int32_t>(
+                static_cast<uint32_t>(b[o]) | (static_cast<uint32_t>(b[o + 1]) << 8) |
+                (static_cast<uint32_t>(b[o + 2]) << 16) |
+                (static_cast<uint32_t>(b[o + 3]) << 24)));
+        };
+        size_t o = 4;  // skip uint16 Vdd + int16 Tchip
+        for (int i = 0; i < 10; ++i) {
+            out->rail_mv[i] = i16(o); o += 2;
+            out->rail_ma[i] = i32(o); o += 4;
+            out->rail_mw[i] = i32(o); o += 4;
+        }
+        out->eps_w = u16(o);   o += 2;
+        out->pcie_w = u16(o);  o += 2;
+        out->mb_w = u16(o);    o += 2;
+        out->total_w = u16(o);
+        return true;
+    }
+
+    static std::string realpath_of(const std::string& p) {
+        char buf[PATH_MAX];
+        const char* r = realpath(p.c_str(), buf);
+        return r ? std::string(r) : std::string();
+    }
+
+    std::string name_ = "PMD2";
+    int fd_ = -1;
+    int fw_ = -1;
+};
+
+const char* const PMD2Probe::kGroupNames[3] = {"EPS", "PCIE", "MB"};
+const char* const PMD2Probe::kRailNames[10] = {
+    "ATX12V", "ATX5V", "ATX5VSB", "ATX3.3V", "HPWR1",
+    "EPS1", "EPS2", "PCIE1", "PCIE2", "PCIE3"};
+
 #if MB_HAVE_FTDI
 // ---------------------------------------------------------------------------
 // INA228 external power meter over an FT232H USB->I2C bridge (libftdi1 MPSSE).
@@ -1444,6 +1647,15 @@ void Probes::discover(std::vector<std::string>* notes) {
         // Before the INA228 bridges: both are external USB meters, and this
         // keeps the board-level rows ahead of the per-rail ones.
         auto p = std::make_unique<PowerZProbe>();
+        bool ok = p->discover();
+        try_add(std::move(p), ok);
+    }
+    {
+        // Same slot in the order as PowerZ, for the same reason: a board-level
+        // meter reads before the per-rail shunts. Not exclusive with it — a
+        // host can carry both, measuring the same board at different points
+        // (PMD2 on the PSU harness, POWER-Z on a USB-C input).
+        auto p = std::make_unique<PMD2Probe>();
         bool ok = p->discover();
         try_add(std::move(p), ok);
     }

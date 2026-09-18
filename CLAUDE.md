@@ -19,12 +19,13 @@ it is only a display string, and nothing dispatches on it.
 Coverage is no longer identical: the GUI has a **Qualcomm IQ** (on-SoC Hexagon
 NSP) probe that the TUI lacks, and both now read **INA228** external power over an
 FT232H bridge (the GUI via **libftdi1** in C++, the TUI via Adafruit Blinka in
-Python — no shared code). The TUI still has a **PMD2** meter probe the GUI lacks.
+Python — no shared code). The GUI gained its own **PMD2** probe 2026-09-18,
+ported from `mb-benchmark-gui` (which had it first) rather than from the TUI.
 Port in either direction as needed — the two have no shared code, so it is a
 reimplementation, not a move.
 
-The UI is **nine sections**, each a scrolling 10 min time-series graph with a
-per-device legend of live values: System Voltage (V), System Current (A),
+The UI is a **Graphs control frame** over **nine sections**, each a scrolling
+time-series graph with a per-device legend of live values: System Voltage (V), System Current (A),
 System Power (W), Accelerator Voltage (V), Accelerator Current (A),
 Accelerator Power (W), Accumulated Energy (J), Temperature (°C), Frequency
 (MHz).
@@ -164,11 +165,20 @@ Clean split between data and UI — keep it that way.
   `set_series_visible()` hides a series without discarding its history and drops
   it from the range calculation.
 
-  **This app exposes no control for either** — it takes the `Max` default, which
-  is exactly the behaviour it had before. The API exists because `GraphArea` is
-  byte-identical with `mb-benchmark-gui`, which drives both from its Graphs
-  section. Keep the file identical (`cmp` after any change) rather than trimming
-  the unused parts.
+  **This app now drives all of it from `GraphControls`** — it used to expose no
+  control and simply take the `Max` default. Keep `GraphArea.{h,cpp}` identical
+  to `mb-benchmark-gui`'s (`cmp` after any change) rather than trimming or
+  extending either copy alone.
+
+  **The graphs keep 30 minutes and draw a window of it.** `kHistory` is
+  `kMaxSpanSeconds + 1` = 1801 samples at 1 Hz — the top of the Time Range
+  control — while `kSpanSeconds` (300) is only the window drawn by default.
+  Buffering the maximum rather than the window is the point: narrowing the
+  window discards nothing, so widening it again brings the older samples
+  straight back. `GraphArea::view_window()` is the one place the two are
+  reconciled, and **both `axis_range()` and `draw()` must use it** — scaling the
+  axis over the whole buffer would let a peak from twenty minutes ago flatten a
+  one-minute window.
 
   Consequence of the `Max` default: the °C axis is no longer pinned at 100. A die
   past 100 used to draw as a flat line on the top edge, indistinguishable from one
@@ -177,6 +187,119 @@ Clean split between data and UI — keep it that way.
   bottom half of the plot, which is the readability problem the headroom rule
   exists to fix. (`nice_ceil` is consequently no longer called from `GraphArea`;
   it stays in `util.h`, which is shared verbatim and must not diverge.)
+- **The header bar carries the panel toggle at its start**, the About button at
+  its end — the same chrome as `mb-benchmark-gui`, added 2026-09-18. It collapses
+  the control pane and gives its width to the graphs. `set_panel_visible()`
+  hides **`side_`**, the Box that wraps `controls_` and carries its 12 px margin:
+  hiding `controls_` alone would leave that margin as an empty strip. That is why
+  this app needs the member where the sibling does not — there the panel *is* the
+  Paned's start child. Hiding the start child is enough; GtkPaned gives the whole
+  area to the remaining child and drops the handle, where detaching would
+  re-parent live widgets and reset `set_position()`.
+
+  **One icon on a `Gtk::ToggleButton`, deliberately not two swapped** —
+  `sidebar-show-symbolic` is in Yaru and Adwaita both, while
+  `sidebar-hide-symbolic` is **Yaru-only** and would render blank on stock
+  Adwaita. **Ctrl+B** is the keyboard equivalent and the first keyboard shortcut
+  in either app: a `Gtk::ShortcutController` on the window, scope MANAGED, because
+  nothing holds the `Gtk::Application`. It flips the button, not the pane, so the
+  two cannot disagree. The toggle is **per-session** — this app has no preference
+  store of any kind.
+- **`GraphControls`** (`src/GraphControls.{h,cpp}`) — the **Graphs** and
+  **Telemetry** frames, ported from `mb-benchmark-gui`'s `ControlPanel`
+  (2026-09-18). It is a `Gtk::Box` *of* frames, not one frame: Graphs is about
+  which devices and how the axes behave, Telemetry about which instruments are
+  drawn at all — the same split and the same two headings as the sibling. It sits in the
+  **start child of a `Gtk::Paned`**, controls left and graphs right, the same
+  arrangement as that app — the frame is the only thing in the pane here, where
+  the sibling's carries the model lists and Start/Stop above the same frame.
+  Three things about that pane are deliberate: the controls get
+  `valign = START` (a frame stretched down the window is mostly empty box with
+  its rows stranded at the top), `set_shrink_start_child(false)` so the handle
+  cannot squeeze them below their minimum, and the default window grew to
+  **1560x820** so the graphs keep roughly the width they had beside a ~620 px
+  pane. The end child is **not** a `ScrolledWindow` — see the fill-layout note
+  below. It builds **three** frames, in the same order as the sibling's panel so
+  the two read alike: **Accelerators**, **Graphs**, **Telemetry**.
+
+  **Accelerators** is one row per card — its name, then an `Enabled` switch.
+  The sibling's rows carry that card's own controls after the switch; there is
+  nothing to configure here, so the row is just the two. The names come from
+  MainWindow, gated on `util::device_accent()` (see below), and the **whole
+  frame hides itself** when no card was found rather than showing an empty box.
+
+  **Graphs** has three rows, each a 12-character label so they align in a
+  column:
+  - **Values Range** — Fixed / Max / Dynamic, driving every graph at once.
+  - **Time Range** — `Auto` (off by default) or a fixed 1-30 minute window
+    (default **5**). Auto draws everything collected, so the traces fill the
+    plot from the first sample instead of hiding off the right edge.
+  The **Accelerators** switches are independent checkboxes, not a radio group:
+  the point is comparing a chosen few on one plot, so "Hailo and Axelera, not
+  the other two" has to be expressible. The sibling hardcodes its five cards from
+  the `Accel` enum; there is no such enum here, so MainWindow passes the
+  discovered device names that **`util::device_accent()`** recognises as cards —
+  the same shared helper that gives each card its colour, which knows the five
+  names (and the Qualcomm board's several spellings) while excluding the ambient
+  probe.
+
+    **The instruments are deliberately not in that section.** It was briefly called
+    *Devices* and built from every discovered device name, which swept the PMD2
+    into it; once Telemetry existed that was a **second control for the same
+    thing**, able to contradict the switch the user actually reached for. The
+    PMD2, POWER-Z and INA228 are governed by their own `Enabled` and nothing
+    else. `device_shown()` returns true for anything with no checkbox, which is
+    what hands them entirely to their own switch.
+  - **Legends** — show/hide the per-device legend under every graph.
+
+  **Telemetry** has one row per meter, in `discover()` order — **POWER-Z**,
+  **PMD2**, **INA228** — which is also the order their graphs appear in.
+  POWER-Z and INA228 get a bare `Enabled` switch each; they publish a handful of
+  series apiece where the PMD2 publishes 34 and earns per-measurement boxes.
+  **A row is built only where the instrument was found**, so nothing sits dead:
+  on this x86_64 host INA228 and PMD2 show and POWER-Z does not.
+
+  **INA228 is matched on the LABEL, not the device name, and that is
+  load-bearing.** A mapped shunt is *folded* onto its card, so its `device_name`
+  is `"Hailo"` and only the label still says so (`Hailo INA228 POWER`) — a
+  device-name test would match none of the 20 shunt metrics on this host.
+  Unmapped rails keep `INA228#<n>`, which the same substring test catches. The
+  device filter has already had its say by then, so an instrument switch is an
+  *additional* gate, not an alternative one.
+
+  - **PMD2** — one checkbox per measurement *point* (not per series: ticking
+    ATX12V governs its watts, volts and amps together), laid out in the meter's
+    own tiers: `Enable` **alone** on the first line — it governs everything
+    below it, and a reading on the same line would read as one more peer of the
+    rails — then the summary tier (**TOTAL** and the three group subtotals),
+    then the ten rails wrapped at five. `Enable` is a master switch
+    that greys the rest rather than clearing them, so a chosen subset survives
+    being switched off and back on. A host with no PMD2 gets no row at all.
+
+    **The tiers are derived, not listed.** `MainWindow` reads them off two
+    structural facts, so a firmware that renames or adds a rail needs no UI
+    change: the TOTAL is the one power metric with **no family suffix** (so
+    `legend_short()` leaves it untouched where it trims every other), and a
+    **rail** is a point that also carries a voltage and a current — only rails
+    are measured, a group is a POWER-only subtotal. Matching is on the exact
+    trimmed name, which is what keeps the `EPS` group apart from the `EPS1` /
+    `EPS2` rails, and `PCIE` from `PCIE1..3`.
+
+  Everything it does is display-only: a hidden trace is hidden, never dropped,
+  so the filter is retroactive and a hidden series is skipped by `axis_range()`.
+  **Every filter hides the legend entry with the trace**, per *cell* since
+  2026-09-18. It used to be per row, which sufficed while only the accelerator
+  filter existed — that hides a card whole — but a Telemetry switch hides
+  **part** of a row: turning INA228 off takes the shunt cell off a card that
+  keeps its own sensors. `LegendRow` therefore carries `head` (device name +
+  aggregate) and `cells`, each cell knowing the index of the metric it draws.
+  The head follows the last surviving cell. All nine aggregates in `on_tick`
+  likewise skip invisible series via one `counted(graph, k)` helper backed by
+  `GraphArea::series_visible()`, or a row would report a max from a trace
+  nobody can see.
+  **Any new handler that reads another widget must go in `conns_`**, which the
+  destructor disconnects — widget members die in reverse declaration order and a
+  handler firing during teardown can otherwise touch one that is already gone.
 - **`MainWindow`** (`src/MainWindow.{h,cpp}`) — builds the two `Gtk::Expander`
   sections, the device-grouped legend, the teal `Gtk::HeaderBar`, and the 1 Hz
   `Glib::signal_timeout` that pushes samples and updates labels. The shared
@@ -237,9 +360,17 @@ the graphs/legend automatically — the UI is metric-agnostic.
   device's swatch+shortlabel+value entries in aligned grid columns (device prefix
   stripped from each label). Keep `value_labels_out` in metric order for the tick
   to update; the aggregate labels ride in a parallel `AggEntry` vector.
+- **Legend cells wrap at `kMaxLegendCellsPerRow` (5), and the labels are
+  shortened for display only.** A device with many metrics otherwise makes the
+  grid far wider than the window; the graph inherits that width, and since
+  `GraphArea` anchors its trace newest-at-the-right-edge, a young history lands
+  off screen entirely and the graph reads as empty. `legend_short()` drops the
+  family suffix (` POWER`, ` VBUS`, …) because each family has its own graph, so
+  the suffix is redundant by construction. **Every wrapped cell joins the same
+  `LegendRow`**, or the Devices filter would hide only part of a device.
 - Refresh cadence / history are the `k*` constants at the top of
-  `MainWindow.cpp` (`kIntervalMs`, `kSpanSeconds` = 600, `kHistory = span + 1`,
-  `kTempAxisMax = 100`). Power axis floor is `set_min_axis_max(10.0)`. Both are
+  `MainWindow.cpp` (`kIntervalMs`, `kSpanSeconds` = 300, `kMaxSpanSeconds` =
+  1800, `kHistory = kMaxSpanSeconds + 1`, `kTempAxisMax = 100`). Power axis floor is `set_min_axis_max(10.0)`. Both are
   **baselines**: a reading that reaches either grows the axis to 10 % above the
   peak (`kHeadroom` in `GraphArea.cpp`).
 
@@ -276,6 +407,27 @@ the graphs/legend automatically — the UI is metric-agnostic.
   So temps "just work" while a Voyager app runs (it loads firmware **and** starts the
   collector) and vanish when the box is rebooted and left idle. Full recovery recipe:
   the `mb-axelera` skill's `references/runtime.md`.
+- **ElmorLabs PMD2** — inline DC meter on the PSU harness, USB CDC
+  (`0483:5740`), ported from `mb-benchmark-gui` 2026-09-18. `0x01` returns
+  `{vid, pid, fw}`; `0x04` returns a 122-byte packed struct — 10 rails of
+  `{int16 mV, int32 mA, int32 mW}` plus four **whole-watt** subtotals
+  (EPS / PCIE / MB / TOTAL). It is a **SYSTEM** instrument like PowerZ, so every
+  reading goes to `sysvoltage_` / `syscurrent_` / `syspower_` and the System
+  graphs, never to a card's families.
+
+  **The three families are what make the CSV-style labels unambiguous**: each
+  metric is suffixed `POWER` / `VBUS` / `CURRENT`, because a rail labelled just
+  `ATX12V` would be the same name in three families — the same collision the
+  INA228 metrics avoid the same way. The GUI trims those suffixes for the
+  legend only.
+
+  Verified on this host 2026-09-18 through a headless `Probes.cpp` driver:
+  14 power + 10 voltage + 10 current metrics, and the meter's own arithmetic
+  checks out — EPS 112 W + MB 26 W = TOTAL 138 W, EPS1 61.4 + EPS2 50.3 ≈ EPS,
+  and the four MB rails sum to 25.6 ≈ MB. Rails reading zero (HPWR1, PCIE1..3
+  on an all-M.2 host) **are** published: a flat zero is a measurement, and
+  suppressing them would make the metric set depend on what happened to be
+  plugged in.
 - **Qualcomm IQ** — the SoC still exposes no power sensor of its own, but the
   board can now be measured from outside it: a **ChargerLAB POWER-Z KM003C**
   inline on the USB-C supply, read by `PowerZProbe`. That is **whole-board**
